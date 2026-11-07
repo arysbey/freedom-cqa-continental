@@ -14,12 +14,14 @@ import type { AttemptView } from './AttemptStatus.js';
 type Summary = Pick<Conversation, 'version' | 'conversationId' | 'groupId' | 'language' | 'channel' | 'classification'> & { messageCount: number; audioAvailable: boolean };
 type Status = { model: string; apiKeyPresent: boolean; freeTierConfirmed: boolean; liveEvaluationCount: number; manualEvaluationCount?: number };
 type Tab = 'review' | 'checklist' | 'quality' | 'submission';
-type Filters = { search: string; language: string; channel: string; group: string; status: string; sort: string };
-const defaultFilters: Filters = { search: '', language: '', channel: '', group: 'DEV', status: '', sort: 'id' };
+type Filters = { search: string; language: string; channel: string; group: string; status: string; gross: string; sort: string };
+const defaultFilters: Filters = { search: '', language: '', channel: '', group: 'DEV', status: '', gross: '', sort: 'id' };
 const speakers = { client: 'Клиент', operator: 'Оператор', bot: 'Бот', system: 'Система' };
 const answerLabel = (answer: string) => ({ YES: 'Да', NO: 'Нет', 'N/A': 'N/A' }[answer] || answer);
 const displayTime = (value: string) => new Date(value).toLocaleString('ru', { timeZone: 'Asia/Qyzylorda' });
 const isAi = (evaluation: Evaluation) => evaluation.status === 'live_validated';
+const hasGrossViolation = (evaluation: Evaluation) => Object.values(evaluation.score.flags).some(Boolean);
+const latestFlagged = (saved: Evaluation[]) => saved.filter(hasGrossViolation).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))[0];
 const originLabel = (evaluation: Evaluation) => isAi(evaluation) ? 'Сохранённый результат API' : evaluation.status === 'manual_demo' ? 'Демонстрационная запись' : 'Ручная оценка';
 const countLabel = (count: number, one: string, few: string, many: string) => {
   const last = count % 10, lastTwo = count % 100;
@@ -77,6 +79,7 @@ export function App() {
 
   const conversationEvaluations = useMemo(() => evaluations.filter(e => e.conversationVersion === selectedVersion), [evaluations, selectedVersion]);
   const evaluation = conversationEvaluations.find(e => e.id === selectedEvaluationId)
+    ?? (filters.gross === 'flagged' ? latestFlagged(conversationEvaluations) : undefined)
     ?? conversationEvaluations.find(e => e.checklistVersion === 'official-v1' && isAi(e))
     ?? conversationEvaluations.find(e => e.checklistVersion === 'official-v1')
     ?? conversationEvaluations[0];
@@ -101,6 +104,7 @@ export function App() {
         && (!filters.language || c.language === filters.language)
         && (!filters.channel || c.channel === filters.channel)
         && (!filters.group || c.groupId === filters.group)
+        && (filters.gross !== 'flagged' || saved.some(hasGrossViolation))
         && (!filters.status || (filters.status === 'none' ? !saved.length : filters.status === 'any' ? Boolean(saved.length) : filters.status === 'ai' ? saved.some(isAi) : saved.some(e => !isAi(e))));
     }).sort((a, b) => {
       if (filters.sort === 'length') return b.messageCount - a.messageCount || a.conversationId.localeCompare(b.conversationId);
@@ -201,7 +205,12 @@ export function App() {
       }
     });
   }
-  function chooseConversation(version: string) { setSelectedVersion(version); setCriterionId('C1'); setError(''); setNotice(''); }
+  function chooseConversation(version: string) {
+    const flagged = filters.gross === 'flagged' ? latestFlagged(countsByVersion.get(version) || []) : undefined;
+    setSelectedVersion(version); setSelectedEvaluationId(flagged?.id || '');
+    setCriterionId(flagged ? Object.keys(flagged.score.flags).find(id => flagged.score.flags[id]) || 'C1' : 'C1');
+    setError(''); setNotice('');
+  }
   function navigateList(event: KeyboardEvent<HTMLDivElement>) {
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key) || !filtered.length) return;
     const target = (event.target as HTMLElement).closest<HTMLButtonElement>('button.conversation');
@@ -245,7 +254,7 @@ export function App() {
     {error && <div role="alert" className="global-message error"><span>{errorText(error)}</span>{!status && <button disabled={busy} onClick={() => void act('Загружаем рабочий набор…', reload)}>Повторить загрузку</button>}<button aria-label="Закрыть сообщение об ошибке" onClick={() => setError('')}>×</button></div>}
     {notice && <div role="status" className="global-message success"><span>{notice}</span><button aria-label="Закрыть уведомление" onClick={() => setNotice('')}>×</button></div>}
     {initialLoading ? <main className="loading-screen" aria-busy="true"><span className="loading-indicator" /><h1>Открываем рабочий набор</h1><p>Загружаются локальные диалоги, чек-листы и сохранённые оценки.</p></main>
-      : tab === 'checklist' ? <ChecklistEditor checklists={checklists} selectedVersion={checklistVersion} onSaved={saved => { setChecklistVersion(saved.version); void reload().catch(e => setError(String(e.message))); }} onError={setError}/>
+      : tab === 'checklist' ? <ChecklistEditor checklists={checklists} selectedVersion={checklistVersion} evaluation={evaluation} onSaved={saved => { setChecklistVersion(saved.version); void reload().catch(e => setError(String(e.message))); }} onError={setError}/>
         : tab === 'quality' ? <QualityPanel onError={setError}/>
           : tab === 'submission' ? <SubmissionPanel/>
           : <main className="workspace">
@@ -277,6 +286,12 @@ export function App() {
                   <label>Канал<select aria-label="Фильтр по каналу" value={filters.channel} onChange={e => setFilters({ ...filters, channel: e.target.value })}><option value="">Все каналы</option>{[...new Set(conversations.map(c => c.channel))].sort().map(value => <option key={value} value={value}>{value === 'voice call' ? 'Звонки' : value === 'agent chat' ? 'Чаты' : value}</option>)}</select></label>
                 </div>
                 <label className="group-filter">Группа<select aria-label="Фильтр по группе" value={filters.group} onChange={e => setFilters({ ...filters, group: e.target.value })}><option value="DEV">DEV · официальный набор ({devCount})</option><option value="">Все группы</option>{[...new Set(conversations.map(c => c.groupId))].filter(value => value !== 'DEV').sort().map(value => <option key={value} value={value}>{value.startsWith('CQA_ACCEPTANCE_') ? `${value} · техническая группа` : value}</option>)}</select></label>
+                <label className="group-filter">Грубые нарушения<select aria-label="Фильтр по грубым нарушениям" value={filters.gross} onChange={event => {
+                  const gross = event.target.value; setFilters({ ...filters, gross }); setSelectedEvaluationId('');
+                  const flagged = gross === 'flagged' ? latestFlagged(conversationEvaluations) : undefined;
+                  if (flagged) { setCriterionId(Object.keys(flagged.score.flags).find(id => flagged.score.flags[id]) || 'C1'); setManualMode(false); }
+                }}><option value="">Все записи</option><option value="flagged">Есть сохранённый флаг</option></select></label>
+                {filters.gross === 'flagged' && <p className="gross-filter-note">Есть флаг хотя бы в одной сохранённой оценке. Откройте запись, чтобы проверить её версию, причину и доказательства.</p>}
                 <details className="extra-filters"><summary>Ещё фильтры</summary>
                   <label>Сохранённая оценка<select aria-label="Фильтр по оценке" value={filters.status} onChange={e => setFilters({ ...filters, status: e.target.value })}><option value="">Любой статус</option><option value="none">Без оценки</option><option value="any">Есть оценка</option><option value="ai">Есть AI-оценка</option><option value="manual">Есть ручная запись</option></select></label>
                   <label>Порядок<select aria-label="Сортировка диалогов" value={filters.sort} onChange={e => setFilters({ ...filters, sort: e.target.value })}><option value="id">По ID</option><option value="language">По языку</option><option value="length">Длинные сначала</option><option value="evaluated">С оценкой сначала</option></select></label>
@@ -289,6 +304,7 @@ export function App() {
                   return <button key={c.version} ref={element => { if (element) conversationButtons.current.set(c.version, element); else conversationButtons.current.delete(c.version); }} data-version={c.version} aria-pressed={c.version === selectedVersion} className={c.version === selectedVersion ? 'conversation selected' : 'conversation'} onClick={() => chooseConversation(c.version)}>
                     <span className="conversation-topline"><strong>{c.conversationId}</strong><span className="language-code">{c.language}</span></span>
                     <span>{c.channel === 'voice call' ? 'Звонок · локальная оценка' : 'Чат'} · {countLabel(c.messageCount, 'реплика', 'реплики', 'реплик')}</span>
+                    {saved.some(hasGrossViolation) && <span className="conversation-flag">Флаг нарушения в оценке</span>}
                     <span className="conversation-footline"><span>{c.groupId}</span><span>{saved.length ? countLabel(saved.length, 'оценка', 'оценки', 'оценок') : 'Без оценки'}</span></span>
                   </button>;
                 })}

@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { validateChecklist } from './checklist.js';
-import type { Checklist, Criterion } from './domain.js';
+import { calculateScore } from './scoring.js';
+import type { Checklist, Criterion, Evaluation } from './domain.js';
 
 interface ChecklistEditorProps {
   checklists: Checklist[];
   selectedVersion: string;
+  evaluation?: Evaluation;
   onSaved: (checklist: Checklist) => void;
   onError?: (message: string) => void;
 }
@@ -26,7 +28,7 @@ function editableChecklist(checklist: Checklist): DraftChecklist {
 function emptyCriterion(): DraftCriterion {
   return editableCriterion({ id: `criterion-${crypto.randomUUID()}`, title: '', instructions: '', weight: 10, answerType: 'boolean', allowedValues: ['YES', 'NO'], scaleMax: 1, naAllowed: false, naCondition: '', section: 'Основная оценка', evidenceRequirement: 'Точная цитата и ID исходной реплики; для отсутствующего действия — проверенный диапазон.', flag: false });
 }
-function snapshot(draft: DraftChecklist): Checklist {
+function snapshot(draft: DraftChecklist, version = `custom-${crypto.randomUUID()}`): Checklist {
   if (!draft.title.trim()) throw new Error('Укажите название чек-листа.');
   if (!draft.criteria.length) throw new Error('Добавьте хотя бы один критерий.');
   const criteria = draft.criteria.map((item, index): Criterion => {
@@ -54,10 +56,10 @@ function snapshot(draft: DraftChecklist): Checklist {
   });
   if (new Set(criteria.map(criterion => criterion.id)).size !== criteria.length) throw new Error('ID каждого критерия должен быть уникальным.');
   // Shared client validation provides fast feedback. The server independently validates this snapshot.
-  return validateChecklist({ id: draft.id, version: `custom-${crypto.randomUUID()}`, title: draft.title.trim(), criteria });
+  return validateChecklist({ id: draft.id, version, title: draft.title.trim(), criteria });
 }
 
-export function ChecklistEditor({ checklists, selectedVersion, onSaved, onError }: ChecklistEditorProps) {
+export function ChecklistEditor({ checklists, selectedVersion, evaluation, onSaved, onError }: ChecklistEditorProps) {
   const initial = checklists.find(checklist => checklist.version === selectedVersion) ?? checklists[0];
   const [draft, setDraft] = useState<DraftChecklist | undefined>(() => initial && editableChecklist(initial));
   const [baseVersion, setBaseVersion] = useState(initial?.version ?? '');
@@ -77,6 +79,17 @@ export function ChecklistEditor({ checklists, selectedVersion, onSaved, onError 
 
   const active = draft?.criteria.find(criterion => criterion.localKey === activeKey) ?? draft?.criteria[0];
   const totalWeight = draft?.criteria.reduce((total, criterion) => total + (criterion.flag ? 0 : Number(criterion.weightText) || 0), 0) ?? 0;
+  const weightPreview = useMemo(() => {
+    if (!evaluation || !draft) return null;
+    const original = checklists.find(item => item.version === evaluation.checklistVersion);
+    if (!original) return null;
+    try {
+      const candidate = snapshot(draft, 'local-weight-preview');
+      const definition = (criterion: Criterion) => JSON.stringify(Object.entries(criterion).filter(([key]) => key !== 'weight').sort(([a], [b]) => a.localeCompare(b)));
+      if (candidate.criteria.length !== original.criteria.length || candidate.criteria.some((criterion, index) => definition(criterion) !== definition(original.criteria[index]))) return { reason: 'Пересчёт тех же ответов доступен только при изменении весов. Для изменённых правил нужна отдельная оценка.' };
+      return { score: calculateScore(candidate, evaluation.results) };
+    } catch { return { reason: 'Заполните допустимые веса и поля, чтобы увидеть точный пересчёт.' }; }
+  }, [draft, evaluation, checklists]);
   function patch(changes: Partial<DraftCriterion>) {
     if (!active) return;
     setDraft(current => current && ({ ...current, criteria: current.criteria.map(criterion => criterion.localKey === active.localKey ? { ...criterion, ...changes } : criterion) }));
@@ -141,6 +154,12 @@ export function ChecklistEditor({ checklists, selectedVersion, onSaved, onError 
         <legend>Чек-лист</legend>
         <label>Название чек-листа<input aria-label="Название чек-листа" value={draft.title} maxLength={20000} required onChange={event => { setDraft({ ...draft, title: event.target.value }); setSavedVersion(''); }} /></label>
         <p className="provider">Критериев: {draft.criteria.length} · Сумма весов: {totalWeight}. Веса применимых критериев нормализуются до 100 баллов. Независимые флаги в сумму не входят.</p>
+        {evaluation && weightPreview && <section className="notice weight-preview" aria-label="Пересчёт сохранённых ответов">
+          <strong>Пересчёт сохранённых ответов · без нового AI</strong>
+          <p>{evaluation.status === 'live_validated' ? 'Ответы предыдущего запроса API' : evaluation.status === 'manual_demo' ? 'Техническая демонстрационная запись' : 'Локальная ручная запись'} · исходная версия {evaluation.checklistVersion}.</p>
+          {'score' in weightPreview && weightPreview.score ? <p>Исходный балл: <strong>{evaluation.score.total === null ? 'Не рассчитывается' : evaluation.score.total.toFixed(2)}</strong> → Предпросмотр: <strong>{weightPreview.score.total === null ? 'Не рассчитывается' : weightPreview.score.total.toFixed(2)} / 100</strong></p> : <p>{weightPreview.reason}</p>}
+          <p>Ответы сохранённой записи остаются прежними. Сохранение создаёт версию чек-листа; предпросмотр не является новой оценкой модели.</p>
+        </section>}
         <label>Редактируемый критерий
           <select aria-label="Редактируемый критерий" value={active?.localKey ?? ''} onChange={event => setActiveKey(event.target.value)}>
             {draft.criteria.map((criterion, index) => <option key={criterion.localKey} value={criterion.localKey}>{index + 1}. {criterion.title || 'Новый критерий'} · {criterion.id}</option>)}

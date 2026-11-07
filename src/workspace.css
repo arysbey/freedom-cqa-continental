@@ -291,6 +291,8 @@ input:disabled, select:disabled, textarea:disabled { background: #edf0e8; opacit
 .dataset-separation { margin: -12px 0 18px; color: var(--muted); font-size: 10px; line-height: 1.65; }
 .dataset-separation button { padding: 0; border: 0; background: transparent; color: var(--green); font-size: inherit; text-decoration: underline; text-underline-offset: 3px; }
 .group-filter { display: block; margin-top: 12px; }
+.gross-filter-note { margin: 8px 0 0; color: #697665; font-size: 10px; line-height: 1.6; }
+.conversation .conversation-flag { color: #8d4d39; font-size: 10px; font-weight: 600; }
 .filter-count { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 10px; color: var(--muted); margin-top: 11px; min-height: 21px; }
 .filter-count button { font-size: 10px; padding: 3px 6px; border: 0; background: transparent; text-decoration: underline; text-underline-offset: 3px; }
 .conversation-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 10px 0; scrollbar-width: thin; scrollbar-color: #bdcdb7 transparent; align-content: start; }
