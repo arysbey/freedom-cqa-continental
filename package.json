@@ -1,0 +1,40 @@
+{
+  "name": "freedom-cqa",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.0.0" },
+  "scripts": {
+    "dev": "tsx watch server/index.ts",
+    "start": "tsx server/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "build": "vite build",
+    "lint": "eslint .",
+    "import:dev": "tsx scripts/import-dev.ts",
+    "models": "tsx scripts/models.ts",
+    "evaluate:first": "tsx scripts/evaluate-first.ts"
+  },
+  "dependencies": {
+    "@google/genai": "^2.3.0",
+    "fastify": "^5.6.2",
+    "@fastify/static": "^8.3.0",
+    "dotenv": "^17.2.3",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "@vitejs/plugin-react": "^5.1.0",
+    "@playwright/test": "^1.56.1",
+    "typescript": "^5.9.3",
+    "tsx": "^4.20.6",
+    "vite": "^7.2.2",
+    "eslint": "^9.39.1",
+    "typescript-eslint": "^8.46.3",
+    "@eslint/js": "^9.39.1"
+  }
+}
