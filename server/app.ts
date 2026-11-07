@@ -8,12 +8,13 @@ import { Store } from './store.js';
 import { initialChecklist, validateChecklist } from '../src/checklist.js';
 import { fetchOrganizerGroup, parseOrganizerResponse } from './importer.js';
 import { evaluateAndSave } from './evaluation-service.js';
-import { publicErrorCode } from './errors.js';
+import { EvaluationRunError, publicErrorCode } from './errors.js';
 import { ReviewStore } from './reviews.js';
 import { QualityStore } from './quality.js';
 import { saveManualEvaluation } from './manual.js';
 import { AudioService, AudioError } from './audio.js';
 import { PermissionStore } from './data-permissions.js';
+import { publicAttempt } from './recovery.js';
 
 export async function createApp(store = new Store(config.dbPath), reviews = new ReviewStore(':memory:'), quality = new QualityStore(':memory:'), permissions = new PermissionStore(store.path)) {
   const app = Fastify({ logger: false, bodyLimit: 1024 * 1024 });
@@ -34,9 +35,12 @@ export async function createApp(store = new Store(config.dbPath), reviews = new 
       if (!req.headers['content-type']?.startsWith('application/json')) return reply.code(415).send({ error: 'JSON_REQUIRED' });
     }
   });
-  app.setErrorHandler((error, _req, reply) => {
+  app.setErrorHandler((error, req, reply) => {
     const code = publicErrorCode(error);
-    reply.code(code === 'EVALUATION_BUSY' ? 409 : 400).send({ error: code });
+    const stored = error instanceof EvaluationRunError ? store.getEvaluationAttempt(error.attemptId) : undefined;
+    const attempt = stored ? publicAttempt(store, stored) : undefined;
+    const runConflict = code === 'IDEMPOTENCY_CONFLICT' && req.url.split('?')[0] === '/api/evaluations';
+    reply.code(runConflict || ['EVALUATION_BUSY', 'RECOVERY_ALREADY_STARTED', 'RECOVERY_LIMIT_REACHED'].includes(code) ? 409 : 400).send({ error: code, ...(attempt ? { attempt, recovery: attempt.recovery } : {}) });
   });
   app.get('/api/status', async () => ({
     phase: 'next-implementation', provider: config.provider, model: config.model, mode: config.mode,
@@ -88,8 +92,14 @@ export async function createApp(store = new Store(config.dbPath), reviews = new 
     return checklist;
   });
   app.get('/api/evaluations', async () => store.listEvaluations());
-  app.get('/api/evaluation-attempts', async () => store.listEvaluationAttempts());
+  app.get('/api/evaluation-attempts', async () => store.listEvaluationAttempts().map(a => publicAttempt(store, a)));
+  app.get<{ Params: { id: string } }>('/api/evaluation-attempts/:id', async (req, reply) => {
+    const attempt = store.getEvaluationAttempt(req.params.id);
+    return attempt ? publicAttempt(store, attempt) : reply.code(404).send({ error: 'ATTEMPT_NOT_FOUND' });
+  });
   app.get<{ Querystring: { manifestId?: string } }>('/api/quality', async req => quality.getDashboard(store, req.query.manifestId));
+  app.get<{ Querystring: { manifestId?: string; cutoff?: string } }>('/api/quality/export', async req => quality.exportComparison(store, req.query.manifestId, req.query.cutoff));
+  app.post('/api/quality/review-rounds', async req => quality.startFreshReviewRound(req.body));
   app.get<{ Params: { caseId: string }; Querystring: { manifestId?: string } }>('/api/quality/cases/:caseId', async req => {
     const manifestId = req.query.manifestId || quality.getManifest()?.id;
     if (!manifestId) throw new Error('VALIDATION_MANIFEST_NOT_FOUND');
@@ -125,8 +135,8 @@ export async function createApp(store = new Store(config.dbPath), reviews = new 
     return reviews.decide(evaluation, checklist, body);
   });
   app.post('/api/evaluations', async req => {
-    const { conversationVersion, checklistVersion } = z.object({ conversationVersion: z.string().min(1), checklistVersion: z.string().min(1) }).strict().parse(req.body);
-    return evaluateAndSave(store, conversationVersion, checklistVersion, { permissions });
+    const { conversationVersion, checklistVersion, requestId, retryOf } = z.object({ conversationVersion: z.string().min(1), checklistVersion: z.string().min(1), requestId: z.string().regex(/^[A-Za-z0-9_-]{8,128}$/).optional(), retryOf: z.string().regex(/^[A-Za-z0-9_-]{8,128}$/).optional() }).strict().parse(req.body);
+    return evaluateAndSave(store, conversationVersion, checklistVersion, { permissions, attemptId: requestId, retryOf });
   });
   if (existsSync(resolve('dist/index.html'))) {
     await app.register(fastifyStatic, { root: resolve('dist') });

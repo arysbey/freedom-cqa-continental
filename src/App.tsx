@@ -7,28 +7,39 @@ import { ManualEvaluationPanel } from './ManualEvaluationPanel.js';
 import { AudioPlayer } from './AudioPlayer.js';
 import { QualityPanel } from './QualityPanel.js';
 import { DataPermissionPanel } from './DataPermissionPanel.js';
+import { AttemptStatus } from './AttemptStatus.js';
+import type { AttemptView } from './AttemptStatus.js';
 
 type Summary = Pick<Conversation, 'version' | 'conversationId' | 'groupId' | 'language' | 'channel' | 'classification'> & { messageCount: number; audioAvailable: boolean };
 type Status = { model: string; apiKeyPresent: boolean; freeTierConfirmed: boolean; liveEvaluationCount: number; manualEvaluationCount?: number };
 type Tab = 'review' | 'checklist' | 'quality';
 type Filters = { search: string; language: string; channel: string; group: string; status: string; sort: string };
-const defaultFilters: Filters = { search: '', language: '', channel: '', group: '', status: '', sort: 'id' };
+const defaultFilters: Filters = { search: '', language: '', channel: '', group: 'DEV', status: '', sort: 'id' };
 const speakers = { client: 'Клиент', operator: 'Оператор', bot: 'Бот', system: 'Система' };
 const answerLabel = (answer: string) => ({ YES: 'Да', NO: 'Нет', 'N/A': 'N/A' }[answer] || answer);
 const displayTime = (value: string) => new Date(value).toLocaleString('ru', { timeZone: 'Asia/Qyzylorda' });
 const isAi = (evaluation: Evaluation) => evaluation.status === 'live_validated';
-const originLabel = (evaluation: Evaluation) => isAi(evaluation) ? 'Реальный API' : evaluation.status === 'manual_demo' ? 'Демонстрационная запись' : 'Ручная оценка';
+const originLabel = (evaluation: Evaluation) => isAi(evaluation) ? 'Сохранённый результат API' : evaluation.status === 'manual_demo' ? 'Демонстрационная запись' : 'Ручная оценка';
 const countLabel = (count: number, one: string, few: string, many: string) => {
   const last = count % 10, lastTwo = count % 100;
   return `${count} ${lastTwo >= 11 && lastTwo <= 14 ? many : last === 1 ? one : last >= 2 && last <= 4 ? few : many}`;
 };
+type ApiFailure = { error?: string; attempt?: AttemptView; recovery?: { canRetry: boolean; reason: string } };
+class ApiRequestError extends Error {
+  constructor(readonly payload: ApiFailure) { super(payload.error || 'REQUEST_FAILED'); }
+}
+function rememberAttempt(current: AttemptView[], attempt: AttemptView) {
+  const existing = current.find(item => item.id === attempt.id);
+  if (existing && existing.status !== 'running' && attempt.status === 'running') return current;
+  return [attempt, ...current.filter(item => item.id !== attempt.id)];
+}
 
 async function request<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(path, body === undefined ? undefined : {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   });
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || 'REQUEST_FAILED');
+  if (!response.ok) throw new ApiRequestError(data);
   return data;
 }
 
@@ -40,6 +51,9 @@ export function App() {
   const [selectedVersion, setSelectedVersion] = useState('');
   const [conversation, setConversation] = useState<Conversation>();
   const [evaluations, setEvaluations] = useState<Evaluation[]>([]);
+  const [attempts, setAttempts] = useState<AttemptView[]>([]);
+  const [activeRequestId, setActiveRequestId] = useState('');
+  const [selectedAttemptId, setSelectedAttemptId] = useState('');
   const [selectedEvaluationId, setSelectedEvaluationId] = useState('');
   const [criterionId, setCriterionId] = useState('C1');
   const [filters, setFilters] = useState<Filters>(defaultFilters);
@@ -61,9 +75,15 @@ export function App() {
   selectedRef.current = selectedVersion;
 
   const conversationEvaluations = useMemo(() => evaluations.filter(e => e.conversationVersion === selectedVersion), [evaluations, selectedVersion]);
-  const evaluation = conversationEvaluations.find(e => e.id === selectedEvaluationId) ?? conversationEvaluations[0];
+  const evaluation = conversationEvaluations.find(e => e.id === selectedEvaluationId)
+    ?? conversationEvaluations.find(e => e.checklistVersion === 'official-v1' && isAi(e))
+    ?? conversationEvaluations.find(e => e.checklistVersion === 'official-v1')
+    ?? conversationEvaluations[0];
   const activeChecklist = checklists.find(c => c.version === (evaluation?.checklistVersion || checklistVersion));
   const selectedRunChecklist = checklists.find(c => c.version === checklistVersion);
+  const conversationAttempts = attempts.filter(item => item.conversationVersion === selectedVersion && item.checklistVersion === checklistVersion)
+    .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+  const selectedAttempt = conversationAttempts.find(item => item.id === selectedAttemptId) || conversationAttempts[0];
   const result = evaluation?.results.find(r => r.criterionId === criterionId);
   const criterion = activeChecklist?.criteria.find(c => c.id === criterionId);
   const busy = Boolean(pending);
@@ -90,15 +110,17 @@ export function App() {
   }, [conversations, filters, countsByVersion]);
   const filterActive = Object.entries(filters).some(([key, value]) => value !== defaultFilters[key as keyof Filters]);
   const selectedHidden = Boolean(selectedVersion && !filtered.some(c => c.version === selectedVersion));
+  const devCount = conversations.filter(c => c.groupId === 'DEV').length;
+  const otherCount = conversations.length - devCount;
 
   async function reload() {
-    const [s, c, k, e] = await Promise.all([
+    const [s, c, k, e, a] = await Promise.all([
       request<Status>('/api/status'), request<Summary[]>('/api/conversations'),
-      request<Checklist[]>('/api/checklists'), request<Evaluation[]>('/api/evaluations'),
+      request<Checklist[]>('/api/checklists'), request<Evaluation[]>('/api/evaluations'), request<AttemptView[]>('/api/evaluation-attempts'),
     ]);
-    setStatus(s); setConversations(c); setChecklists(k); setEvaluations(e);
-    setChecklistVersion(v => v || k[0]?.version || '');
-    setSelectedVersion(v => v || c.find(item => item.conversationId === 'p1-ru-001')?.version || c[0]?.version || '');
+    setStatus(s); setConversations(c); setChecklists(k); setEvaluations(e); setAttempts(a);
+    setChecklistVersion(v => v || k.find(item => item.version === 'official-v1')?.version || k[0]?.version || '');
+    setSelectedVersion(v => v || c.find(item => item.groupId === 'DEV' && item.conversationId === 'p1-ru-001')?.version || c.find(item => item.groupId === 'DEV')?.version || c[0]?.version || '');
   }
   useEffect(() => {
     void reload().catch(e => setError(String(e.message))).finally(() => setInitialLoading(false));
@@ -123,6 +145,23 @@ export function App() {
   useEffect(() => {
     if (tab === 'review') conversationButtons.current.get(selectedVersion)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }, [selectedVersion, filtered, tab]);
+  useEffect(() => {
+    if (!activeRequestId) return;
+    let active = true;
+    let polling = false;
+    const poll = async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        const attempt = await request<AttemptView>(`/api/evaluation-attempts/${encodeURIComponent(activeRequestId)}`);
+        if (active) setAttempts(current => rememberAttempt(current, attempt));
+      } catch { /* A POST may not have registered yet; only its own response reports failure. */ }
+      finally { polling = false; }
+    };
+    void poll();
+    const interval = window.setInterval(() => void poll(), 1200);
+    return () => { active = false; window.clearInterval(interval); };
+  }, [activeRequestId]);
 
   async function act(label: string, action: () => Promise<void>) {
     setPending(label); setError(''); setNotice('');
@@ -135,6 +174,31 @@ export function App() {
     if (selectedRef.current === saved.conversationVersion) { setSelectedEvaluationId(saved.id); setManualMode(false); setManualPicked([]); }
     setNotice(isAi(saved) ? 'Оценка модели сохранена вместе с доказательствами и версией чек-листа.' : 'Локальная ручная запись сохранена. Для неё доступны апелляция и история пересмотра.');
     await reload();
+  }
+  async function evaluate(retryOf?: string) {
+    const requestId = crypto.randomUUID();
+    const sourceVersion = selectedVersion;
+    const rubricVersion = checklistVersion;
+    setSelectedAttemptId(requestId);
+    setActiveRequestId(requestId);
+    await act('Ожидаем ответ бесплатной модели…', async () => {
+      try {
+        const saved = await request<Evaluation>('/api/evaluations', { conversationVersion: sourceVersion, checklistVersion: rubricVersion, requestId, ...(retryOf ? { retryOf } : {}) });
+        await acceptEvaluation(saved);
+      } catch (cause) {
+        if (cause instanceof ApiRequestError && cause.payload.attempt) {
+          const attempt = { ...cause.payload.attempt, conversationVersion: sourceVersion, checklistVersion: rubricVersion, recovery: cause.payload.recovery || cause.payload.attempt.recovery };
+          setAttempts(current => rememberAttempt(current, attempt));
+        }
+        throw cause;
+      } finally {
+        try {
+          const attempt = await request<AttemptView>(`/api/evaluation-attempts/${encodeURIComponent(requestId)}`);
+          setAttempts(current => rememberAttempt(current, attempt));
+        } catch { /* The failed HTTP response remains authoritative when the ledger cannot be reached. */ }
+        setActiveRequestId('');
+      }
+    });
   }
   function chooseConversation(version: string) { setSelectedVersion(version); setCriterionId('C1'); setError(''); setNotice(''); }
   function navigateList(event: KeyboardEvent<HTMLDivElement>) {
@@ -183,10 +247,10 @@ export function App() {
         : tab === 'quality' ? <QualityPanel onError={setError}/>
           : <main className="workspace">
             <aside className="sidebar" aria-label="Диалоги и фильтры">
-              <div className="sidebar-heading"><p className="eyebrow">Рабочий набор</p><h1>Диалоги <span>{conversations.length}</span></h1></div>
+              <div className="sidebar-heading"><p className="eyebrow">Рабочий набор</p><h1>DEV <span>{devCount}</span></h1><p className="dataset-separation">Официальный набор · {devCount} записей{otherCount > 0 && <><br/><button onClick={() => setFilters({ ...defaultFilters, group: '' })}>Другие группы: {otherCount}</button></>}</p></div>
               <form className="import-form" onSubmit={event => {
                 event.preventDefault();
-                void act('Импортируем группу…', async () => { const imported = await request<{ inserted: number; unchanged: number }>('/api/import', { groupId: group }); await reload(); setNotice(`Импорт ${group}: добавлено ${imported.inserted}, без изменений ${imported.unchanged}.`); });
+                void act('Импортируем группу…', async () => { const imported = await request<{ inserted: number; unchanged: number }>('/api/import', { groupId: group }); await reload(); setFilters({ ...defaultFilters, group }); setNotice(`Импорт ${group}: добавлено ${imported.inserted}, без изменений ${imported.unchanged}. В списке выбрана импортированная группа.`); });
               }}>
                 <label className="sr-only" htmlFor="group">Группа импорта</label>
                 <input id="group" value={group} onChange={event => setGroup(event.target.value)} required pattern="[A-Za-z0-9_-]{1,64}" maxLength={64}/>
@@ -199,8 +263,8 @@ export function App() {
                   if (file.size > 15 * 1024 * 1024) throw new Error('Файл превышает допустимые 15 МБ.');
                   let payload: unknown;
                   try { payload = JSON.parse((await file.text()).replace(/^\uFEFF/, '')); } catch { throw new Error('Файл не содержит корректный JSON организатора.'); }
-                  const imported = await request<{ inserted: number; unchanged: number }>('/api/import-file', { payload });
-                  await reload(); setNotice(`Локальный JSON: добавлено ${imported.inserted}, без изменений ${imported.unchanged}. Это не проверка доступности GET API.`);
+                  const imported = await request<{ inserted: number; unchanged: number; groupId: string }>('/api/import-file', { payload });
+                  await reload(); setFilters({ ...defaultFilters, group: imported.groupId }); setNotice(`Локальный JSON: добавлено ${imported.inserted}, без изменений ${imported.unchanged}. В списке выбрана группа ${imported.groupId}. Это не проверка доступности GET API.`);
                 });
               }}/></div>
               <div className="filters">
@@ -209,12 +273,12 @@ export function App() {
                   <label>Язык<select aria-label="Фильтр по языку" value={filters.language} onChange={e => setFilters({ ...filters, language: e.target.value })}><option value="">Все языки</option>{[...new Set(conversations.map(c => c.language))].sort().map(value => <option key={value}>{value}</option>)}</select></label>
                   <label>Канал<select aria-label="Фильтр по каналу" value={filters.channel} onChange={e => setFilters({ ...filters, channel: e.target.value })}><option value="">Все каналы</option>{[...new Set(conversations.map(c => c.channel))].sort().map(value => <option key={value} value={value}>{value === 'voice call' ? 'Звонки' : value === 'agent chat' ? 'Чаты' : value}</option>)}</select></label>
                 </div>
+                <label className="group-filter">Группа<select aria-label="Фильтр по группе" value={filters.group} onChange={e => setFilters({ ...filters, group: e.target.value })}><option value="DEV">DEV · официальный набор ({devCount})</option><option value="">Все группы</option>{[...new Set(conversations.map(c => c.groupId))].filter(value => value !== 'DEV').sort().map(value => <option key={value} value={value}>{value.startsWith('CQA_ACCEPTANCE_') ? `${value} · техническая группа` : value}</option>)}</select></label>
                 <details className="extra-filters"><summary>Ещё фильтры</summary>
-                  <label>Группа<select aria-label="Фильтр по группе" value={filters.group} onChange={e => setFilters({ ...filters, group: e.target.value })}><option value="">Все группы</option>{[...new Set(conversations.map(c => c.groupId))].sort().map(value => <option key={value}>{value}</option>)}</select></label>
                   <label>Сохранённая оценка<select aria-label="Фильтр по оценке" value={filters.status} onChange={e => setFilters({ ...filters, status: e.target.value })}><option value="">Любой статус</option><option value="none">Без оценки</option><option value="any">Есть оценка</option><option value="ai">Есть AI-оценка</option><option value="manual">Есть ручная запись</option></select></label>
                   <label>Порядок<select aria-label="Сортировка диалогов" value={filters.sort} onChange={e => setFilters({ ...filters, sort: e.target.value })}><option value="id">По ID</option><option value="language">По языку</option><option value="length">Длинные сначала</option><option value="evaluated">С оценкой сначала</option></select></label>
                 </details>
-                <div className="filter-count"><span aria-live="polite">Показано {filtered.length} из {conversations.length}</span>{filterActive && <button onClick={() => setFilters(defaultFilters)}>Сбросить</button>}</div>
+                <div className="filter-count"><span aria-live="polite">Показано {filtered.length}{filters.group === 'DEV' ? ` из ${devCount} DEV` : ` из ${conversations.length}`}</span>{filterActive && <button onClick={() => setFilters(defaultFilters)}>К DEV</button>}</div>
               </div>
               <div className="conversation-list" aria-label="Список диалогов" onKeyDown={navigateList}>
                 {filtered.map(c => {
@@ -236,7 +300,7 @@ export function App() {
                 {conversation && <><div className="source-meta"><span>{conversation.channel === 'voice call' ? 'Голосовой звонок' : 'Переписка'}</span><span>{countLabel(conversation.messages.length, 'реплика', 'реплики', 'реплик')}</span><span>Группа {conversation.groupId}</span></div><label className="transcript-search"><span className="sr-only">Поиск по транскрипту</span><input type="search" aria-label="Поиск по транскрипту" placeholder="Найти фрагмент в этом разговоре…" value={transcriptSearch} maxLength={200} onChange={e => setTranscriptSearch(e.target.value)}/></label></>}
                 <a className="mobile-panel-link" href="#assessment-panel">Перейти к оценке ↓</a>
               </div>
-              {selectedHidden && <p className="notice compact-notice">Выбранный диалог скрыт текущими фильтрами. <button onClick={() => setFilters(defaultFilters)}>Показать в списке</button></p>}
+              {selectedHidden && <p className="notice compact-notice">Выбранный диалог скрыт текущими фильтрами. <button onClick={() => setFilters({ ...defaultFilters, group: conversation?.groupId || '' })}>Показать в списке</button></p>}
               {conversation?.channel === 'voice call' && <><AudioPlayer conversation={conversation}/><p className="source-note">Звонок обрабатывается локально. Внутренняя консультация может иметь ту же роль «оператор»; проверяйте контекст и не оценивайте дикцию по тексту.</p></>}
               {conversation && conversation.classification !== 'synthetic_allowed' && <p className="notice compact-notice">Передача этого разговора в бесплатный Gemini запрещена. Доступны локальные доказательства, ручная оценка и пересмотр.</p>}
               {manualMode && conversation && <p className="source-note manual-source-note">Выберите критерий в ручной форме, затем нажмите «В доказательства» у нужной реплики. Исходный текст остаётся неизменным.</p>}
@@ -261,18 +325,19 @@ export function App() {
             <section className="assessment" id="assessment-panel" aria-labelledby="assessment-title">
               <div className="panel-heading"><div><p className="eyebrow">Оценка оператора</p><h2 id="assessment-title">{evaluation ? evaluation.score.total === null ? 'Не рассчитывается' : `${evaluation.score.total.toFixed(2)} / 100` : 'Оценки пока нет'}</h2></div>{evaluation && <span className={`badge ${isAi(evaluation) ? '' : 'local-badge'}`}>{originLabel(evaluation)}</span>}</div>
               <a className="mobile-panel-link" href="#transcript-panel">↑ Вернуться к транскрипту</a>
-              {evaluation && <p className="result-version">Открыт результат: <strong>{activeChecklist?.title || evaluation.checklistVersion}</strong><span>{evaluation.checklistVersion}</span></p>}
+              {evaluation && <p className="result-version">Открыт сохранённый результат: <strong>{activeChecklist?.title || evaluation.checklistVersion}</strong><span>{evaluation.checklistVersion === 'official-v1' ? 'Официальный чек-лист · official-v1' : `Настроенная версия · ${evaluation.checklistVersion}`}</span>{isAi(evaluation) && <span>Запрос выполнен {displayTime(evaluation.createdAt)}. Открытие результата не вызывает модель.</span>}</p>}
               <div className="evaluation-actions">
                 <label>Чек-лист для новой оценки<select aria-label="Чек-лист" value={checklistVersion} onChange={e => setChecklistVersion(e.target.value)}>{checklists.map(c => <option value={c.version} key={c.version}>{c.title} · {c.version}</option>)}</select></label>
-                <button className="primary" disabled={busy || !canAiEvaluate || !conversation?.messages.length} onClick={() => void act('Ожидаем ответ бесплатной модели…', async () => {
-                  const saved = await request<Evaluation>('/api/evaluations', { conversationVersion: selectedVersion, checklistVersion });
-                  await acceptEvaluation(saved);
-                })}>{pending === 'Ожидаем ответ бесплатной модели…' ? 'Выполняется запрос…' : 'Оценить через бесплатную модель'}</button>
+                {checklistVersion === 'official-v1' && <p className="run-checklist-note">Новый запуск: официальный чек-лист, 8 критериев. Изменённую версию можно выбрать отдельно.</p>}
+                {evaluation && evaluation.checklistVersion !== checklistVersion && <p className="availability-note">Показанные баллы относятся к сохранённой версии выше. Новый запрос будет использовать выбранный здесь чек-лист.</p>}
+                <button className="primary" disabled={busy || !canAiEvaluate || !conversation?.messages.length} onClick={() => void evaluate()}>{pending === 'Ожидаем ответ бесплатной модели…' ? 'Выполняется запрос…' : 'Оценить через бесплатную модель'}</button>
                 <p className="provider">{status?.model || 'Провайдер не настроен'} · Free tier · {status?.apiKeyPresent ? 'ключ настроен на сервере' : 'нужен API-ключ'}</p>
                 {aiUnavailableReason && <p className="availability-note">{aiUnavailableReason}</p>}
                 {pending && <p role="status" className="operation-status"><span className="loading-indicator"/>{pending}</p>}
                 <button className="manual-toggle" aria-expanded={manualMode} disabled={!conversation || !selectedRunChecklist || busy} onClick={() => { setManualMode(!manualMode); setManualPicked([]); }}>{manualMode ? 'Закрыть ручную форму' : 'Создать ручную оценку'}</button>
               </div>
+              {conversationAttempts.length > 1 && <label className="attempt-history-label">История запросов<select aria-label="История запросов" disabled={busy} value={selectedAttempt?.id || ''} onChange={event => setSelectedAttemptId(event.target.value)}>{conversationAttempts.map(item => <option key={item.id} value={item.id}>{displayTime(item.startedAt)} · {item.status === 'succeeded' ? 'Оценка сохранена' : item.status === 'failed' ? `Без оценки · ${item.errorCode}` : 'Выполняется'}</option>)}</select></label>}
+              {selectedAttempt && (!activeRequestId || selectedAttempt.id === activeRequestId) && <AttemptStatus attempt={selectedAttempt} busy={busy} canRetry={Boolean(selectedAttempt.recovery?.canRetry && canAiEvaluate && conversation?.messages.length)} onRetry={() => void evaluate(selectedAttempt.id)}/>}
               {conversation && <DataPermissionPanel conversation={conversation} onApproved={async () => {
                 const version = conversation.version;
                 await reload();
@@ -291,7 +356,7 @@ export function App() {
               {criterion && <div className="reasoning criterion-details"><p className="eyebrow">Выбранный критерий · {criterion.id}</p><h3>{criterion.title}</h3><div className="criterion-config"><span>{criterion.flag ? 'Без числового веса' : `Вес ${criterion.weight}`}</span><span>Шкала: {criterion.allowedValues.map(answerLabel).join(' / ')}{criterion.naAllowed ? ' / N/A' : ''}</span></div><details><summary>Правила сохранённой версии</summary><p>{criterion.instructions}</p>{criterion.naAllowed && <p><strong>Условие N/A:</strong> {criterion.naCondition}</p>}<p><strong>Доказательства:</strong> {criterion.evidenceRequirement}</p></details>{result ? <ResultDetails result={result} jump={jump}/> : <p className="provider">Ответ по этому критерию ещё не сохранён.</p>}</div>}
               {evaluation && <>
                 <details className="reasoning section-results"><summary>Результаты разделов</summary>{Object.entries(evaluation.score.sections).map(([section, score]) => <p key={section}>{section}<strong>{score.total === null ? 'Без числовой оценки' : `${score.total.toFixed(2)} / 100`}</strong></p>)}</details>
-                <div className="evaluation-provenance"><p className="eyebrow">Происхождение результата</p><p><strong>{originLabel(evaluation)}</strong>{isAi(evaluation) ? ` · ${evaluation.model}` : evaluation.reviewer ? ` · ${evaluation.reviewer}` : ''}<br/>{displayTime(evaluation.createdAt)} · Asia/Qyzylorda</p>{isAi(evaluation) ? <p>Время модели: {(evaluation.latencyMs / 1000).toFixed(1)} сек. · запросов: {evaluation.providerCallCount}<br/>Токенов в ответе провайдера: {evaluation.usage.totalTokens ?? 'не сообщено'}. Это не подтверждение смысловой точности.</p> : <p>{evaluation.status === 'manual_demo' ? 'Техническая демонстрация ручного ввода. Не является человеческим эталоном или AI-оценкой.' : 'Ответы внесены локально проверяющим. Вызов модели для этой оценки не выполнялся.'}</p>}<p className={Object.values(evaluation.score.flags).some(Boolean) ? 'gross-flag is-present' : 'gross-flag'}>Грубые ошибки: <strong>{Object.values(evaluation.score.flags).some(Boolean) ? 'ДА' : 'нет'}</strong></p></div>
+                <div className="evaluation-provenance"><p className="eyebrow">Происхождение результата</p><p><strong>{originLabel(evaluation)}</strong>{isAi(evaluation) ? ` · ${evaluation.model}` : evaluation.reviewer ? ` · ${evaluation.reviewer}` : ''}<br/>{displayTime(evaluation.createdAt)} · Asia/Qyzylorda</p>{isAi(evaluation) ? <p>Это сохранённый ответ предыдущего реального запроса. Новый вызов выполняется только кнопкой оценки.<br/>Время модели: {(evaluation.latencyMs / 1000).toFixed(1)} сек. · запросов: {evaluation.providerCallCount}<br/>Токенов в ответе провайдера: {evaluation.usage.totalTokens ?? 'не сообщено'}. Это не подтверждение смысловой точности.</p> : <p>{evaluation.status === 'manual_demo' ? 'Техническая демонстрация ручного ввода. Не является человеческим эталоном или AI-оценкой.' : 'Ответы внесены локально проверяющим. Вызов модели для этой оценки не выполнялся.'}</p>}<p className={Object.values(evaluation.score.flags).some(Boolean) ? 'gross-flag is-present' : 'gross-flag'}>Грубые ошибки: <strong>{Object.values(evaluation.score.flags).some(Boolean) ? 'ДА' : 'нет'}</strong></p></div>
                 {activeChecklist && <ReviewPanel key={evaluation.id} evaluation={evaluation} checklist={activeChecklist} onError={setError}/>}
               </>}
             </section>
@@ -348,7 +413,15 @@ function errorText(code: string) {
     PROVIDER_RATE_LIMIT: 'Бесплатная квота временно исчерпана. Новая оценка не сохранена. Платный fallback не включался.',
     PROVIDER_TIMEOUT: 'Модель не ответила вовремя. Новая оценка не сохранена; предыдущие результаты доступны.',
     PROVIDER_FAILED: 'Провайдер не выполнил оценку. Новый результат не создан.',
+    PROVIDER_NETWORK_ERROR: 'Связь с провайдером прервалась. Новая оценка не сохранена; сведения о повторах доступны в истории запроса.',
+    PROVIDER_EMPTY_RESULT: 'Провайдер вернул пустой ответ. Новая оценка не сохранена.',
+    INVALID_MODEL_JSON: 'Ответ модели отклонён: формат результата некорректен. Новая оценка не сохранена.',
     INVALID_EVIDENCE: 'Ответ модели отклонён: доказательства не прошли проверку. Новая оценка не сохранена.',
+    IDEMPOTENCY_CONFLICT: 'Этот идентификатор запроса уже связан с другим диалогом или чек-листом. Новая оценка не запущена.',
+    RECOVERY_LIMIT_REACHED: 'Однократный повтор этой попытки уже использован. Новый автоматический запрос не выполнялся.',
+    RECOVERY_ALREADY_STARTED: 'Для этой попытки уже начат явный повтор. Его состояние доступно в истории запросов.',
+    RECOVERY_NOT_AVAILABLE: 'Для этой причины повтор недоступен. Сначала устраните указанное ограничение.',
+    RECOVERY_SOURCE_MISMATCH: 'Повтор должен использовать тот же диалог, чек-лист и модель. Новый запрос не выполнен.',
     DATA_POLICY_RESTRICTED: 'Внешняя AI-оценка запрещена для этого источника. Используйте локальную ручную форму.',
     REQUEST_FAILED: 'Запрос не выполнен. Проверьте соединение с локальным сервером и конфигурацию.',
     IMPORT_SCHEMA_INVALID: 'Файл не соответствует формату набора организаторов. Выберите исходный JSON.',

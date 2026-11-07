@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { Checklist, Conversation } from '../src/domain.js';
-import { GeminiProvider, minimizeConversation, safeProviderFailure, type ProviderConfig, type ProviderTransport } from '../server/provider.js';
+import { GeminiProvider, getProviderConfigurationIdentity, getProviderTelemetry, minimizeConversation, safeProviderFailure, type ProviderConfig, type ProviderTelemetry, type ProviderTransport } from '../server/provider.js';
 
 const config: ProviderConfig = { apiKey: 'test-double-key-not-live', freeTierConfirmed: true, provider: 'gemini', model: 'gemini-3.8-flash', mode: 'free', timeoutMs: 1000, retryLimit: 0 };
 const conversation: Conversation = { version: 'v1', groupId: 'TEST', conversationId: 'invented-only', channel: 'chat', language: 'RU', classification: 'synthetic_allowed', audioAvailable: false, messages: [{ id: 'v1:0', position: 0, timestamp: '00:00', speaker: 'operator', text: 'Здравствуйте! Меня зовут Алина.' }] };
@@ -110,4 +110,126 @@ test('safe diagnostics never copy arbitrary SDK fields, messages, URL or credent
   assert.deepEqual(failure, { httpStatus: 503, errorName: 'ApiError', errorCode: 'UNAVAILABLE', causeName: 'TypeError', causeCode: 'UND_ERR_CONNECT_TIMEOUT' });
   assert.equal(JSON.stringify(failure).includes('secret'), false);
   assert.deepEqual(safeProviderFailure({ status: 'not-status-secret', name: 'secret-key', code: 'secret-key', cause: { name: 'secret-key', code: 'secret-key' } }), { httpStatus: null, errorName: null, errorCode: null, causeName: null, causeCode: null });
+});
+
+for (const code of ['ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']) {
+  test(`transient ${code} recovers once with unchanged request and unknown failed-call usage`, async () => {
+    const requests: Array<{ model: string; contents: string; systemInstruction: string; schema: Record<string, unknown>; timeoutMs: number }> = [];
+    let calls = 0;
+    const recovering: ProviderTransport = { ...transport, generate: async request => {
+      requests.push({ model: request.model, contents: request.contents, systemInstruction: request.systemInstruction, schema: request.schema, timeoutMs: request.timeoutMs });
+      if (++calls === 1) throw new TypeError('untrusted key and request content', { cause: Object.assign(new Error('secret-source'), { code }) });
+      return transport.generate(request);
+    } };
+    const result = await new GeminiProvider({ ...config, retryLimit: 1 }, recovering).evaluate(conversation, checklist);
+    assert.equal(calls, 2); assert.equal(result.providerCallCount, 2); assert.equal(result.telemetry.retryCount, 1);
+    assert.equal(result.telemetry.attempts[0].failure?.causeCode, code);
+    assert.equal(result.telemetry.attempts[0].retryPlanned, true); assert.equal(result.telemetry.attempts[0].retryDelayMs, 500);
+    assert.equal(result.telemetry.unknownUsageCalls, 1); assert.equal(result.telemetry.reportedUsage.totalTokens, 130);
+    const { timeoutMs: firstTimeout, ...firstRequest } = requests[0]; const { timeoutMs: secondTimeout, ...secondRequest } = requests[1];
+    assert.deepEqual(firstRequest, secondRequest); assert(secondTimeout < firstTimeout);
+    assert.equal(result.configuration.promptVersion, 'evidence-first-v2');
+    assert.equal(JSON.stringify(result.telemetry).includes('untrusted key'), false);
+  });
+}
+
+test('persistent network failures stop after two actual calls even with a larger requested retry limit', async () => {
+  let calls = 0;
+  try {
+    await new GeminiProvider({ ...config, timeoutMs: 2000, retryLimit: 99 }, { ...transport, generate: async () => { calls++; throw { cause: { code: 'ECONNRESET' }, message: 'secret' }; } }).evaluate(conversation, checklist);
+    assert.fail('Expected bounded failure');
+  } catch (error) {
+    assert.equal(calls, 2);
+    const telemetry = getProviderTelemetry(error)!;
+    assert.equal(telemetry.providerCallCount, 2); assert.equal(telemetry.retryLimit, 1); assert.equal(telemetry.outcome, 'failed');
+    assert.equal(telemetry.attempts[1].stopReason, 'retry_limit'); assert.equal(telemetry.unknownUsageCalls, 2);
+    assert.equal(telemetry.reportedUsage.totalTokens, null);
+  }
+});
+
+test('recovery does not start another call when backoff plus minimum retry budget will not fit', async () => {
+  let calls = 0;
+  try {
+    await new GeminiProvider({ ...config, retryLimit: 1 }, { ...transport, generate: async () => {
+      calls++; await new Promise(resolve => setTimeout(resolve, 300)); throw { cause: { code: 'ECONNRESET' } };
+    } }).evaluate(conversation, checklist);
+    assert.fail('Expected exhausted recovery budget');
+  } catch (error) {
+    const telemetry = getProviderTelemetry(error)!;
+    assert.equal(calls, 1); assert.equal(telemetry.attempts[0].stopReason, 'budget_exhausted');
+    assert.equal(telemetry.attempts[0].retryPlanned, false);
+  }
+});
+
+test('one total deadline covers first call, backoff and a stalled second call', async () => {
+  let calls = 0; let secondSignal: AbortSignal | undefined; let secondTimeout = 0;
+  const started = performance.now();
+  try {
+    await new GeminiProvider({ ...config, retryLimit: 1 }, { ...transport, generate: async request => {
+      if (++calls === 1) throw { status: 503 };
+      secondSignal = request.signal; secondTimeout = request.timeoutMs; return new Promise(() => {});
+    } }).evaluate(conversation, checklist);
+    assert.fail('Expected deadline');
+  } catch (error) {
+    const telemetry = getProviderTelemetry(error)!;
+    assert.equal((error as { code: string }).code, 'PROVIDER_TIMEOUT'); assert.equal(calls, 2); assert.equal(secondSignal?.aborted, true);
+    assert(secondTimeout > 0 && secondTimeout < 650); assert(performance.now() - started < 1400);
+    assert.equal(telemetry.totalBudgetMs, 1000); assert.equal(telemetry.attempts[1].stopReason, 'timeout');
+  }
+});
+
+for (const failure of [{ status: 504, name: 'ApiError' }, { name: 'AbortError' }, { cause: { code: 'ETIMEDOUT' } }, { cause: { code: 'CERT_HAS_EXPIRED' } }]) {
+  test(`actual timeouts, aborts and non-transient failures are not auto-retried: ${JSON.stringify(failure)}`, async () => {
+    let calls = 0;
+    let caught: unknown;
+    try { await new GeminiProvider({ ...config, retryLimit: 1 }, { ...transport, generate: async () => { calls++; throw failure; } }).evaluate(conversation, checklist); }
+    catch (error) { caught = error; }
+    assert.equal(calls, 1); assert.equal(getProviderTelemetry(caught)?.retryCount, 0);
+  });
+}
+
+test('invalid JSON, fabricated evidence and missing required ranges preserve response usage without an automatic repair call', async () => {
+  const missingRange = output(); missingRange.results[0].answer = 'NO';
+  const responses = [{ text: 'not json', usageMetadata: { totalTokenCount: 130 } }, { text: JSON.stringify(output('fabricated quote')), usageMetadata: { totalTokenCount: 130 } }, { text: JSON.stringify(missingRange), usageMetadata: { totalTokenCount: 130 } }];
+  for (const response of responses) {
+    let calls = 0; let caught: unknown;
+    try { await new GeminiProvider({ ...config, retryLimit: 1 }, { ...transport, generate: async () => { calls++; return response; } }).evaluate(conversation, checklist); }
+    catch (error) { caught = error; }
+    assert(caught); assert.equal(calls, 1);
+    const telemetry = getProviderTelemetry(caught)!;
+    assert.equal(telemetry.outcome, 'failed'); assert.equal(telemetry.reportedUsage.totalTokens, 130); assert.equal(telemetry.unknownUsageCalls, 0);
+    assert.equal(telemetry.retryCount, 0); assert.equal(telemetry.attempts[0].status, 'response-received');
+  }
+});
+
+test('observers see safe running/retry/terminal snapshots, cannot mutate internals and cannot fail a valid result', async () => {
+  let calls = 0; const events: ProviderTelemetry[] = [];
+  const observer = (event: ProviderTelemetry) => { events.push(structuredClone(event)); event.providerCallCount = 999; event.attempts.length = 0; throw new Error('observer unavailable'); };
+  const result = await new GeminiProvider({ ...config, retryLimit: 1 }, { ...transport, generate: async request => {
+    if (++calls === 1) throw { cause: { code: 'ENOTFOUND' }, message: 'signed-url-and-private-key' };
+    return transport.generate(request);
+  } }, observer).evaluate(conversation, checklist);
+  assert.equal(result.providerCallCount, 2); assert.equal(result.telemetry.attempts.length, 2);
+  assert(events.some(e => e.outcome === 'running' && e.providerCallCount === 1 && e.attempts[0]?.status === 'running'));
+  assert(events.some(e => e.attempts[0]?.retryPlanned === true)); assert.equal(events.at(-1)?.outcome, 'succeeded');
+  assert.equal(JSON.stringify(events).includes('signed-url-and-private-key'), false);
+  assert.equal(JSON.stringify(events).includes(conversation.messages[0].text), false);
+});
+
+test('preflight failures report zero calls and telemetry getter rejects forged/untrusted properties', async () => {
+  let caught: unknown; const events: ProviderTelemetry[] = [];
+  try { await new GeminiProvider({ ...config, apiKey: undefined }, transport, e => events.push(e)).evaluate(conversation, checklist); } catch (error) { caught = error; }
+  const telemetry = getProviderTelemetry(caught)!;
+  assert.equal(telemetry.providerCallCount, 0); assert.deepEqual(telemetry.attempts, []); assert.equal(telemetry.diagnosticId, null);
+  assert.equal(events.at(-1)?.terminalCode, 'MISSING_API_KEY');
+  telemetry.providerCallCount = 999; assert.equal(getProviderTelemetry(caught)?.providerCallCount, 0);
+  assert.equal(getProviderTelemetry({ telemetry, code: 'secret-code', message: 'secret-key' }), undefined);
+});
+
+test('semantic identity is stable across transport recovery and excludes credentials', () => {
+  const before = getProviderConfigurationIdentity(config);
+  const recovered = getProviderConfigurationIdentity({ ...config, apiKey: 'different-private-key', timeoutMs: 120000, retryLimit: 1 });
+  assert.deepEqual(before, recovered); assert.match(before.configurationFingerprint, /^[a-f0-9]{64}$/);
+  assert.equal(before.promptVersion, 'evidence-first-v2'); assert.equal(before.schemaVersion, 'criterion-evidence-v1');
+  assert.equal(JSON.stringify(before).includes(config.apiKey!), false);
 });

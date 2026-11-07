@@ -43,6 +43,7 @@ export class Store {
         id TEXT PRIMARY KEY,
         json TEXT NOT NULL
       );
+      CREATE UNIQUE INDEX IF NOT EXISTS evaluation_one_recovery ON evaluation_attempts(json_extract(json,'$.recoveryOf')) WHERE json_extract(json,'$.recoveryOf') IS NOT NULL;
     `);
   }
 
@@ -128,6 +129,17 @@ export class Store {
     return (this.db.prepare('SELECT json FROM evaluations ORDER BY rowid DESC').all() as JsonRow[]).map(row => JSON.parse(row.json) as Evaluation);
   }
 
+  saveEvaluationWithAttempt(evaluation: Evaluation, attempt: EvaluationAttempt): void {
+    if (attempt.status !== 'succeeded' || attempt.evaluationId !== evaluation.id) throw new Error('INVALID_ATTEMPT_RESULT');
+    if (evaluation.attemptId !== attempt.id || evaluation.conversationVersion !== attempt.conversationVersion || evaluation.checklistVersion !== attempt.checklistVersion || evaluation.model !== attempt.model) throw new Error('ATTEMPT_RESULT_SOURCE_MISMATCH');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.saveEvaluation(evaluation);
+      this.finishEvaluationAttempt(attempt);
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
   getEvaluation(id: string): Evaluation | undefined {
     const row = this.db.prepare('SELECT json FROM evaluations WHERE id = ?').get(id) as JsonRow | undefined;
     return row ? JSON.parse(row.json) as Evaluation : undefined;
@@ -135,14 +147,36 @@ export class Store {
 
   startEvaluationAttempt(attempt: EvaluationAttempt): void {
     if (attempt.status !== 'running') throw new Error('INVALID_ATTEMPT_STATE');
+    if (attempt.recoveryOf && this.getEvaluationRecovery(attempt.recoveryOf)) throw new Error('RECOVERY_ALREADY_STARTED');
     this.db.prepare('INSERT INTO evaluation_attempts(id,json) VALUES (?,?)').run(attempt.id, canonicalJson(attempt));
+  }
+
+  getEvaluationAttempt(id: string): EvaluationAttempt | undefined {
+    const row = this.db.prepare('SELECT json FROM evaluation_attempts WHERE id=?').get(id) as JsonRow | undefined;
+    return row ? JSON.parse(row.json) as EvaluationAttempt : undefined;
+  }
+
+  getEvaluationRecovery(id: string): EvaluationAttempt | undefined {
+    const row = this.db.prepare("SELECT json FROM evaluation_attempts WHERE json_extract(json,'$.recoveryOf')=?").get(id) as JsonRow | undefined;
+    return row ? JSON.parse(row.json) as EvaluationAttempt : undefined;
+  }
+
+  updateRunningEvaluationAttempt(attempt: EvaluationAttempt): void {
+    const previous = this.getEvaluationAttempt(attempt.id);
+    if (!previous || previous.status !== 'running' || attempt.status !== 'running') throw new Error('INVALID_ATTEMPT_STATE');
+    this.assertAttemptSource(previous, attempt);
+    this.db.prepare('UPDATE evaluation_attempts SET json=? WHERE id=?').run(canonicalJson(attempt), attempt.id);
+  }
+
+  private assertAttemptSource(previous: EvaluationAttempt, attempt: EvaluationAttempt): void {
+    if (previous.conversationVersion !== attempt.conversationVersion || previous.checklistVersion !== attempt.checklistVersion || previous.model !== attempt.model || previous.startedAt !== attempt.startedAt || (previous.recoveryOf ?? null) !== (attempt.recoveryOf ?? null) || (previous.recoveryDepth ?? 0) !== (attempt.recoveryDepth ?? 0) || (previous.requestId ?? null) !== (attempt.requestId ?? null)) throw new Error('IMMUTABLE_ATTEMPT_SOURCE');
   }
 
   finishEvaluationAttempt(attempt: EvaluationAttempt): void {
     const row = this.db.prepare('SELECT json FROM evaluation_attempts WHERE id=?').get(attempt.id) as JsonRow | undefined;
     const previous = row ? JSON.parse(row.json) as EvaluationAttempt : undefined;
     if (!previous || previous.status !== 'running' || attempt.status === 'running') throw new Error('INVALID_ATTEMPT_STATE');
-    if (previous.conversationVersion !== attempt.conversationVersion || previous.checklistVersion !== attempt.checklistVersion || previous.model !== attempt.model || previous.startedAt !== attempt.startedAt) throw new Error('IMMUTABLE_ATTEMPT_SOURCE');
+    this.assertAttemptSource(previous, attempt);
     this.db.prepare('UPDATE evaluation_attempts SET json=? WHERE id=?').run(canonicalJson(attempt), attempt.id);
   }
 

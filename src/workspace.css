@@ -288,6 +288,9 @@ input:disabled, select:disabled, textarea:disabled { background: #edf0e8; opacit
 .extra-filters { margin-top: 12px; }
 .extra-filters > summary { cursor: pointer; font-size: 11px; color: #536f57; line-height: 1.6; }
 .extra-filters > label { margin-top: 10px; }
+.dataset-separation { margin: -12px 0 18px; color: var(--muted); font-size: 10px; line-height: 1.65; }
+.dataset-separation button { padding: 0; border: 0; background: transparent; color: var(--green); font-size: inherit; text-decoration: underline; text-underline-offset: 3px; }
+.group-filter { display: block; margin-top: 12px; }
 .filter-count { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 10px; color: var(--muted); margin-top: 11px; min-height: 21px; }
 .filter-count button { font-size: 10px; padding: 3px 6px; border: 0; background: transparent; text-decoration: underline; text-underline-offset: 3px; }
 .conversation-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 10px 0; scrollbar-width: thin; scrollbar-color: #bdcdb7 transparent; align-content: start; }
@@ -326,16 +329,30 @@ input:disabled, select:disabled, textarea:disabled { background: #edf0e8; opacit
 .search-fragment { background: #f1dfaa; }
 .mobile-panel-link { display: none; }
 .local-badge { background: #e8eef2; color: #526c76; }
+.assessment > .panel-heading > .badge { flex: 0 1 150px; white-space: normal; line-height: 1.5; text-align: right; }
 .result-version { font-size: 11px; color: var(--muted); line-height: 1.65; margin: -6px 0 22px; }
 .result-version strong { color: #4b6650; font-weight: 600; }
 .result-version > span { display: block; font-size: 9px; color: #8a9686; overflow-wrap: anywhere; }
 .evaluation-actions { border: 1px solid #d9e2d2; border-radius: 8px; padding: 16px; background: #f1f5eb; }
 .evaluation-actions > label { margin-bottom: 13px; }
 .evaluation-actions .provider { margin: 9px 0; font-size: 10px; }
+.run-checklist-note { margin: -3px 0 13px; color: #5b7354; font-size: 10px; line-height: 1.65; }
 .availability-note { font-size: 11px; color: #797046; line-height: 1.6; margin: 8px 0 12px; }
 .manual-toggle { width: 100%; margin-top: 5px; font-size: 12px; padding: 9px; background: transparent; color: #4c6b51; }
 .manual-toggle[aria-expanded='true'] { background: #e5edde; border-color: #a1ba94; }
 .operation-status { display: flex; align-items: center; gap: 8px; font-size: 11px; color: #4b7050; line-height: 1.6; }
+.attempt-status { margin-top: 14px; padding: 14px; border: 1px solid #d7e1cf; border-radius: 7px; background: #f6f8f1; }
+.assessment .attempt-history-label { margin: 17px 0 -5px; font-size: 10px; }
+.attempt-status.attempt-failed { border-color: #e0cfb3; background: #faf6ed; }
+.attempt-heading { display: grid; gap: 5px; font-size: 11px; line-height: 1.5; }
+.attempt-heading > span { color: var(--muted); font-size: 10px; }
+.attempt-status p { margin: 10px 0; font-size: 10px; line-height: 1.7; color: #63745b; }
+.attempt-status > button { width: 100%; margin-top: 4px; font-size: 11px; }
+.attempt-events { padding-left: 18px; margin: 12px 0; font-size: 10px; line-height: 1.65; color: #65725d; }
+.attempt-events li { margin: 8px 0; padding-left: 2px; }
+.attempt-events li > strong, .attempt-events li > span { display: block; }
+.attempt-events li > strong { font-weight: 600; color: #456345; }
+.attempt-status summary { cursor: pointer; font-size: 10px; color: #58734f; line-height: 1.6; padding-top: 4px; }
 .saved-evaluation-label { margin-top: 22px; }
 .assessment-empty { padding: 24px 0 0; }
 .criterion-details > h3 { font-size: 19px; margin-top: 0; }

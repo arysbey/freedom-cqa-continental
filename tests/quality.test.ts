@@ -81,6 +81,50 @@ test('semantic probes are reported separately rather than changing balanced core
   const value = metrics([reference()], [attempt()], [model()], m); assert.equal(value.byCriterion.C1.total, 0); assert.equal(value.semanticProbes[0].matches, 4);
 });
 
+test('first technically valid recorded result is fixed; reruns cannot cherry-pick agreement', () => {
+  const first = model(); const later = model(['NO', 'YES', '0', 'YES'], 'later');
+  const value = metrics([reference()], [attempt(), attempt({ id: 'later-attempt', evaluationId: later.id })], [later, first]);
+  assert.equal(value.selectionPolicy, 'first-valid-in-recorded-run-order');
+  assert.equal(value.byCriterion.C1.matches, 1); assert.equal(value.materialDisagreements.length, 0);
+  const invalid = model(); invalid.results[0].evidence[0].quote = 'Invented';
+  const accepted = metrics([reference()], [attempt(), attempt({ id: 'later-attempt', evaluationId: later.id })], [invalid, later]);
+  assert.equal(accepted.coverage.excludedInvalidModelResults, 1); assert.equal(accepted.evidence.evaluationsChecked, 2);
+  assert.equal(accepted.evidence.evaluationsValid, 1); assert.equal(accepted.byCriterion.C1.matches, 0);
+  const rejectedOnly = metrics([reference()], [attempt()], [invalid]);
+  assert.equal(rejectedOnly.comparedCases, 0); assert.equal(rejectedOnly.byCriterion.C1.agreement, null);
+});
+
+test('unresolved references and absent positives do not become reviewed cases or zero sensitivity', () => {
+  const unresolved = reference(); unresolved.judgments = unresolved.judgments.map(j => ({ ...j, resolved: false, answer: null })); unresolved.score = null;
+  const empty = metrics([unresolved]);
+  assert.equal(empty.humanReviewedCases, 0); assert.equal(empty.comparedCases, 0); assert.equal(empty.status, 'awaiting_human_review');
+  assert.equal(empty.coverage.casesWithReference, 1); assert.equal(empty.coverage.unannotatedJudgments, 4);
+  const absent = metrics(); assert.equal(absent.coverage.casesWithoutReference, 1); assert.equal(absent.coverage.unannotatedJudgments, 4);
+  const negative = metrics([reference()]);
+  assert.equal(negative.grossViolations.referencePositives, 0); assert.equal(negative.grossViolations.recall, null);
+  assert.equal(negative.grossViolations.precision, null); assert.equal(negative.grossViolations.specificity, 1);
+  assert.equal(negative.na.missedNARate, null);
+});
+
+test('weighted-complete references permit score MAE while an independent flag remains unresolved', () => {
+  const ref = reference(); ref.judgments[3] = { ...ref.judgments[3], resolved: false, answer: null }; ref.score = null;
+  const value = metrics([ref]);
+  assert.equal(value.totalScoreError.dialogs, 1); assert.equal(value.totalScoreError.meanAbsoluteError, 0);
+  assert.equal(value.coverage.weightedCompleteCases, 1); assert.equal(value.coverage.fullyResolvedCases, 0);
+  assert.equal(value.grossViolations.total, 0); assert.equal(value.byCriterion.C8.total, 0);
+  const staleScore = reference(); staleScore.score!.total = 0;
+  assert.equal(metrics([staleScore]).totalScoreError.meanAbsoluteError, 0, 'cached scores cannot change deterministic reference scoring');
+});
+
+test('semantic evidence judgments only count for selected evaluation, exact reference versions and resolved criterion', () => {
+  const ref = reference(); ref.judgments[1] = { ...ref.judgments[1], resolved: false, answer: null }; ref.score = null;
+  const review = { id: 'semantic-fixture', manifestId: 'test-manifest', caseId: 'case', evaluationId: 'eval', criterionId: 'C1', reviewerId: 'software-fixture', humanAttestation: true as const, verdict: 'supports' as const, category: 'evidence' as const, comment: 'Software fixture only.', createdAt: '2026-11-07T02:00:00.000Z', requestId: 'semantic-fixture' };
+  const value = computeValidationMetrics(manifest(), [ref], [attempt()], [model()], [source], [checklist], [review, { ...review, id: 'wrong-evaluation', evaluationId: 'other' }, { ...review, id: 'unresolved', criterionId: 'C2' }]);
+  assert.equal(value.evidence.humanSemantic.reviewed, 1); assert.equal(value.evidence.humanSemantic.supportRate, 1);
+  const otherVersion = computeValidationMetrics(manifest(), [{ ...ref, checklistVersion: 'other' }], [attempt()], [model()], [source], [checklist], [review]);
+  assert.equal(otherVersion.evidence.humanSemantic.reviewed, 0); assert.equal(otherVersion.humanReviewedCases, 0);
+});
+
 // The exact permitted synthetic source below is used only to test privacy gates and persistence.
 const approvedRecord = { conversation_id: 'p1-ru-001', channel: 'agent chat', language: 'RU', audio_url: null, transcript: [
   { timestamp: '00:00', speaker: 'client', text: 'Где посмотреть мой тариф? В приложении не нахожу.' },
@@ -108,6 +152,45 @@ function persistentFixture() {
   const e = model(['YES', 'N/A', 'N/A', '20', 'YES', '10', 'NO', 'NO'], 'fixture-live-evaluation', conversation, initialChecklist); store.saveEvaluation(e);
   return { path, dbPath, store, quality, conversation, m, input, evaluation: e, close() { quality.close(); store.close(); removeLocalTemp(path); } };
 }
+
+test('numeric score visibility cannot leak an unresolved independent flag through rows or flags', () => {
+  const f = persistentFixture();
+  try {
+    f.quality.recordRun(f.m.id, attempt({ evaluationId: f.evaluation.id }), f.store);
+    const input = structuredClone(f.input); input.judgments = input.judgments.map(j => j.criterionId === 'C8' ? { ...j, resolved: false, answer: null, evidence: [], checkedRange: null } : j);
+    const ref = f.quality.saveReference(f.conversation, initialChecklist, input);
+    assert.equal(ref.score, null, 'stored immutable reference retains existing full-score semantics');
+    const view = f.quality.getCase(f.m.id, 'case', f.store);
+    assert.notEqual(view.referenceNumericScore, null); assert.notEqual(view.modelEvaluation?.score, null);
+    assert.equal(JSON.stringify(view.modelEvaluation).includes('C8'), false);
+    assert.equal(f.quality.getDashboard(f.store).metrics?.totalScoreError.dialogs, 1);
+    const exported = f.quality.exportComparison(f.store, f.m.id, '2030-01-01T00:00:00.000Z');
+    assert.equal(exported.comparisons.length, 7); assert.equal(exported.comparisons.some(c => c.criterionId === 'C8'), false);
+    assert.equal(exported.comparisons[0].human.resolved, true); assert.equal(exported.comparisons[0].matches, true);
+  } finally { f.close(); }
+});
+
+test('comparison export is reproducible, cutoff-bound, private and does not reveal unresolved model answers', () => {
+  const f = persistentFixture();
+  try {
+    f.quality.recordRun(f.m.id, attempt({ evaluationId: f.evaluation.id }), f.store);
+    const cutoff = '2030-01-01T00:00:00.000Z';
+    const first = f.quality.exportComparison(f.store, f.m.id, cutoff);
+    const second = f.quality.exportComparison(f.store, f.m.id, cutoff);
+    assert.equal(first.reportHash, second.reportHash); assert.equal(first.manifestHash.length, 64);
+    assert.equal(first.metrics.humanReviewedCases, 0); assert.equal(first.metrics.totalScoreError.meanAbsoluteError, null);
+    assert.equal(first.provenance.cases[0].selectedEvaluation?.id, f.evaluation.id);
+    assert.equal(JSON.stringify(first).includes('Software fixture, not a human judgment.'), false);
+    assert.equal(first.provenance.cases[0].sourceHash?.length, 64);
+    const before = f.quality.exportComparison(f.store, f.m.id, '2026-11-07T00:30:00.000Z');
+    assert.equal(before.provenance.cases[0].selectedEvaluation, null); assert.equal(before.metrics.reliability.attempts, 0);
+    assert.throws(() => f.quality.exportComparison(f.store, f.m.id, 'invalid'));
+    assert.throws(() => f.quality.exportComparison(f.store, f.m.id, '2026-11-06T00:00:00.000Z'), /CUTOFF/);
+    const readonly = new QualityStore(f.dbPath, { readOnly: true });
+    try { assert.equal(readonly.exportComparison(f.store, f.m.id, cutoff).reportHash, first.reportHash); }
+    finally { readonly.close(); }
+  } finally { f.close(); }
+});
 test('manifest source permission, frozen content and exclusion of prior tuning cases are enforced', () => {
   const q = new QualityStore(':memory:');
   try {
@@ -183,5 +266,81 @@ test('human semantic evidence judgments require a prior blind reference and surv
     const reopened = new QualityStore(f.dbPath); const reopenedStore = new Store(f.dbPath);
     assert.equal(reopened.getReference(f.m.id, 'case')?.id, ref.id); assert.equal(reopened.listEvidenceReviews(f.m.id)[0].id, review.id);
     const direct = new DatabaseSync(f.dbPath); assert.throws(() => direct.exec('DELETE FROM quality_references'), /append-only/); direct.close(); reopened.close(); reopenedStore.close();
+  } finally { if (!closed) { f.quality.close(); f.store.close(); } removeLocalTemp(f.path); }
+});
+
+test('fresh manifest review round clears current progress without deleting history, model results or another manifest', () => {
+  const f = persistentFixture();
+  try {
+    f.quality.recordRun(f.m.id, attempt({ evaluationId: f.evaluation.id }), f.store);
+    const original = f.quality.saveReference(f.conversation, initialChecklist, f.input);
+    const semantic = f.quality.saveEvidenceReview({ manifestId: f.m.id, caseId: 'case', evaluationId: f.evaluation.id, criterionId: 'C1', reviewerId: 'software-fixture-only', humanAttestation: true, verdict: 'supports', category: 'evidence', comment: 'Isolated software fixture, not real human review.', requestId: 'old-semantic' }, f.store);
+    const otherManifest = { ...f.m, id: 'other-manifest' }; f.quality.saveManifest(otherManifest, [f.conversation], initialChecklist);
+    const other = f.quality.saveReference(f.conversation, initialChecklist, { ...f.input, manifestId: otherManifest.id, requestId: 'other-reference' });
+    const before = f.quality.exportComparison(f.store, f.m.id, semantic.createdAt);
+    assert.equal(before.metrics.humanReviewedCases, 1); assert.equal(before.metrics.evidence.humanSemantic.reviewed, 1);
+    const round = f.quality.startFreshReviewRound({ manifestId: f.m.id, reviewerId: 'software-fixture-reset-actor', requestId: 'reset-fixture', expectedRoundId: 'legacy' });
+    assert.equal(round.previousRoundId, 'legacy'); assert.deepEqual(round.supersededReviewerIds, ['software-fixture-only']);
+    assert.match(round.note, /does not restore blindness/);
+    const dashboard = f.quality.getDashboard(f.store, f.m.id);
+    assert.equal(dashboard.reviewRound?.id, round.id); assert.equal(dashboard.referenceCount, 0);
+    assert.equal(dashboard.metrics?.humanReviewedCases, 0); assert.equal(dashboard.metrics?.byCriterion.C1.agreement, null);
+    assert.equal(dashboard.metrics?.totalScoreError.meanAbsoluteError, null); assert.equal(dashboard.metrics?.evidence.humanSemantic.reviewed, 0);
+    assert.equal(f.quality.getCase(f.m.id, 'case', f.store).modelEvaluation, null);
+    assert.equal(f.quality.getReference(f.m.id, 'case'), undefined);
+    assert.equal(f.quality.listReferenceHistory(f.m.id)[0].id, original.id); assert.equal(f.quality.listReferences(f.m.id, { includeSuperseded: true }).length, 1);
+    assert.equal(f.quality.listEvidenceReviewHistory(f.m.id)[0].id, semantic.id); assert.equal(f.quality.listEvidenceReviews(f.m.id).length, 0);
+    assert.equal(f.quality.getReference(otherManifest.id, 'case')?.id, other.id); assert.equal(f.quality.getReviewRound(otherManifest.id).id, 'legacy');
+    assert.equal(f.store.getEvaluation(f.evaluation.id)?.id, f.evaluation.id); assert.deepEqual(f.quality.getManifest(f.m.id), f.m);
+    assert.equal(f.quality.exportComparison(f.store, f.m.id, semantic.createdAt).reportHash, before.reportHash, 'a pre-reset cutoff stays exactly reproducible');
+    const current = f.quality.exportComparison(f.store, f.m.id, round.createdAt!);
+    assert.equal(current.reviewRound.id, round.id); assert.equal(current.metrics.humanReviewedCases, 0); assert.equal(current.provenance.referenceHistory.length, 1);
+    assert.equal(current.provenance.referenceHistory[0].includedInCurrentRound, false);
+  } finally { f.close(); }
+});
+
+test('new review round rejects stale retries and permits new partial human inputs with untouched blanks', () => {
+  const f = persistentFixture();
+  try {
+    f.quality.recordRun(f.m.id, attempt({ evaluationId: f.evaluation.id }), f.store);
+    const original = f.quality.saveReference(f.conversation, initialChecklist, f.input);
+    const resetInput = { manifestId: f.m.id, reviewerId: 'software-fixture-only', requestId: 'fresh-reset', expectedRoundId: 'legacy' };
+    const round = f.quality.startFreshReviewRound(resetInput);
+    assert.equal(f.quality.startFreshReviewRound(resetInput).id, round.id, 'exact reset retry is idempotent while still active');
+    assert.throws(() => f.quality.saveReference(f.conversation, initialChecklist, f.input), /REVIEW_ROUND_CHANGED/);
+    assert.throws(() => f.quality.saveReference(f.conversation, initialChecklist, { ...f.input, requestId: 'explicit-old-round', reviewRoundId: 'legacy' }), /REVIEW_ROUND_CHANGED/);
+    const freshInput = { ...structuredClone(f.input), requestId: 'fresh-partial', reviewRoundId: round.id };
+    freshInput.judgments = freshInput.judgments.map((judgment, index) => index === 0 ? judgment : { ...judgment, resolved: false, answer: null, explanation: '', applicabilityRationale: '', evidence: [], checkedRange: null });
+    const invalid = structuredClone(freshInput); invalid.judgments[0].explanation = '';
+    assert.throws(() => f.quality.saveReference(f.conversation, initialChecklist, invalid), /explanation/);
+    const fresh = f.quality.saveReference(f.conversation, initialChecklist, freshInput);
+    assert.equal(fresh.reviewRoundId, round.id); assert.notEqual(fresh.id, original.id); assert.equal(fresh.judgments[1].explanation, '');
+    assert.equal(f.quality.saveReference(f.conversation, initialChecklist, freshInput).id, fresh.id);
+    assert.equal(f.quality.listReferenceHistory(f.m.id).length, 2); assert.equal(f.quality.listReferences(f.m.id).length, 1);
+    const modelView = f.quality.getCase(f.m.id, 'case', f.store).modelEvaluation;
+    assert.equal(modelView?.results.length, 1); assert.equal(modelView?.score, null);
+    assert.throws(() => f.quality.saveEvidenceReview({ manifestId: f.m.id, caseId: 'case', evaluationId: f.evaluation.id, criterionId: 'C1', reviewerId: 'software-fixture-only', humanAttestation: true, verdict: 'supports', category: 'evidence', comment: 'Software fixture.', requestId: 'missing-round-review' }, f.store), /REVIEW_ROUND_CHANGED/);
+    const second = f.quality.startFreshReviewRound({ ...resetInput, requestId: 'second-reset', expectedRoundId: round.id });
+    assert.equal(second.previousRoundId, round.id);
+    assert.throws(() => f.quality.startFreshReviewRound(resetInput), /REVIEW_ROUND_CHANGED/, 'a superseded reset retry cannot claim to be current');
+    assert.throws(() => f.quality.saveReference(f.conversation, initialChecklist, freshInput), /REVIEW_ROUND_CHANGED/, 'old idempotent reference retry stays stale after another round');
+    assert.equal(f.quality.listReviewRounds(f.m.id).length, 2);
+  } finally { f.close(); }
+});
+
+test('active review round and immutable old references survive restart', () => {
+  const f = persistentFixture(); let closed = false;
+  try {
+    const reference = f.quality.saveReference(f.conversation, initialChecklist, f.input);
+    const round = f.quality.startFreshReviewRound({ manifestId: f.m.id, reviewerId: 'software-fixture-only', requestId: 'persistent-reset', expectedRoundId: 'legacy' });
+    f.quality.close(); f.store.close(); closed = true;
+    const reopened = new QualityStore(f.dbPath); const store = new Store(f.dbPath);
+    try {
+      assert.equal(reopened.getReviewRound(f.m.id).id, round.id); assert.equal(reopened.listReferences(f.m.id).length, 0);
+      assert.equal(reopened.listReferenceHistory(f.m.id)[0].id, reference.id); assert.equal(reopened.getDashboard(store).metrics?.humanReviewedCases, 0);
+      const direct = new DatabaseSync(f.dbPath);
+      try { for (const table of ['quality_references', 'quality_review_rounds']) for (const operation of ['DELETE FROM', 'UPDATE']) assert.throws(() => direct.exec(operation === 'UPDATE' ? `UPDATE ${table} SET json='{}'` : `DELETE FROM ${table}`), /append-only/); }
+      finally { direct.close(); }
+    } finally { reopened.close(); store.close(); }
   } finally { if (!closed) { f.quality.close(); f.store.close(); } removeLocalTemp(f.path); }
 });

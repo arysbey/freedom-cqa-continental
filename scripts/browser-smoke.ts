@@ -18,10 +18,16 @@ try {
   await page.goto(base);
   await page.getByRole('heading', { name: 'p1-ru-001', exact: true }).waitFor();
   const conversations = await (await page.request.get(`${base}/api/conversations`)).json();
+  const devRecords = conversations.filter((c: { groupId: string }) => c.groupId === 'DEV').length;
+  assert.equal(await page.getByRole('combobox', { name: 'Фильтр по группе', exact: true }).inputValue(), 'DEV');
+  assert.equal(await page.getByRole('combobox', { name: 'Чек-лист', exact: true }).inputValue(), 'official-v1');
+  assert.equal(await page.locator('.conversation').count(), devRecords);
+  await page.getByRole('combobox', { name: 'Фильтр по группе', exact: true }).selectOption('');
   assert.equal(await page.locator('.conversation').count(), conversations.length);
+  await page.getByRole('combobox', { name: 'Фильтр по группе', exact: true }).selectOption('DEV');
   const evaluationCount = (await (await page.request.get(`${base}/api/status`)).json()).liveEvaluationCount;
   if (evaluationCount) {
-    await page.locator('.assessment > .panel-heading .badge').filter({ hasText: 'Реальный API' }).waitFor();
+    await page.locator('.assessment > .panel-heading .badge').filter({ hasText: 'Сохранённый результат API' }).waitFor();
     await page.locator('.criterion').first().click();
     await page.locator('.evidence-link').first().click();
     assert(await page.locator('.message:focus').count() > 0);
