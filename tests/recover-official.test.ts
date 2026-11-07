@@ -116,3 +116,12 @@ test('server generation identity is verified before each POST so an old server c
   const api = client(fixture()); await assert.rejects(executeOfficialRecoveries({ ...api, beforePost: async () => assertRecoveryServerConfiguration({ ...current, configurationFingerprint: identity.compatiblePreviousFingerprint }) }, clock()), /LOCAL_SERVER_GENERATION_CONFIGURATION_MISMATCH/);
   assert.equal(api.posts.length, 0);
 });
+
+test('intentional current-configuration recovery ignores a valid old-profile AI result without changing legacy default reuse', async () => {
+  const state = fixture(); const old = success(state.dataset.conversations[0], 'old-profile-request'); old.configuration.configurationFingerprint = 'old-valid-configuration'; state.dataset.evaluations.push(old);
+  assert.equal(planOfficialRecovery(state)[0].action, 'reused');
+  state.batch.requireCurrentConfiguration = true; assert.equal(planOfficialRecovery(state)[0].action, 'eligible');
+  const api = client(state); await executeOfficialRecoveries(api, clock()); assert.equal(api.posts.length, 1);
+  const latest = state.dataset.evaluations.at(-1)!; latest.configuration.configurationFingerprint = state.batch.configurationFingerprint;
+  assert.equal(planOfficialRecovery(state)[0].action, 'reused'); await executeOfficialRecoveries(api, clock()); assert.equal(api.posts.length, 1);
+});

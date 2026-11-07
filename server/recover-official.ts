@@ -42,7 +42,8 @@ export function planOfficialRecovery(state: OfficialRecoveryState, options: Offi
     const lastRun = record.runs.at(-1); const parentId = lastRun?.requestId || null;
     const item: OfficialRecoveryItem = { conversationId: record.conversationId, conversationVersion: record.conversationVersion, parentId, requestId: parentId ? officialRecoveryRequestId(parentId) : null, action: 'ineligible', reason: 'NO_RECOVERABLE_ORIGINAL_FAILURE', evaluationId: null };
     if (!source) return { ...item, reason: 'ORIGINAL_SOURCE_VERSION_NOT_CURRENT' };
-    const selected = selectOfficialEvaluation(source, dataset.checklists, dataset.evaluations, config.model).evaluation;
+    const eligibleEvaluations = batch.requireCurrentConfiguration ? dataset.evaluations.filter(e => e.status === 'human_entered' && e.origin === 'human' || e.configuration.configurationFingerprint === batch.configurationFingerprint) : dataset.evaluations;
+    const selected = selectOfficialEvaluation(source, dataset.checklists, eligibleEvaluations, config.model).evaluation;
     if (selected) return { ...item, action: 'reused', reason: 'VALID_OFFICIAL_RESULT_ALREADY_SAVED', evaluationId: selected.id };
     if (source.channel !== 'agent chat' || source.audioAvailable || source.classification === 'real_restricted') return { ...item, reason: 'LOCAL_HUMAN_REVIEW_REQUIRED' };
     if (!isApprovedSyntheticConversation(source) && !(source.classification === 'unknown' && state.approvedSyntheticVersions?.includes(source.version))) return { ...item, reason: 'DATA_PERMISSION_REQUIRED' };
