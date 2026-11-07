@@ -13,17 +13,17 @@ const browserErrors: string[] = [];
 page.on('pageerror', e => browserErrors.push(e.message));
 try {
   await page.goto(base);
-  await page.getByText('Реальный API', { exact: true }).waitFor();
+  await page.locator('.assessment > .panel-heading .badge').filter({ hasText: 'Реальный API' }).waitFor();
   const before = await (await page.request.get(`${base}/api/evaluations`)).json() as Evaluation[];
   const original = before.find(e => e.checklistVersion === 'official-v1');
   assert(original, 'A saved actual official evaluation is required before the dynamic acceptance.');
   let checklist: Checklist;
   let evaluation: Evaluation;
   if (process.argv.includes('--resume')) {
-    const saved = before.find(e => e.conversationVersion === original.conversationVersion && e.results.some(r => r.criterionId === 'C9'));
+    const allChecklists = await (await page.request.get(`${base}/api/checklists`)).json() as Checklist[];
+    const saved = before.find(e => e.conversationVersion === original.conversationVersion && e.results.some(r => r.criterionId === 'C9' && r.answer === 'NO') && allChecklists.find(c => c.version === e.checklistVersion)?.criteria.some(c => c.id === 'C9' && c.title === 'Ссылка на справочную страницу') && (!process.argv.includes('--refine-rubric') || (e.results.find(r => r.criterionId === 'C2')?.answer === 'N/A' && e.results.find(r => r.criterionId === 'C7')?.answer === 'NO')));
     assert(saved, 'No actual saved dynamic evaluation to resume.');
     evaluation = saved;
-    const allChecklists = await (await page.request.get(`${base}/api/checklists`)).json() as Checklist[];
     checklist = allChecklists.find(c => c.version === saved.checklistVersion)!;
     assert(checklist);
   } else {
@@ -48,7 +48,7 @@ try {
   checklist = await response.json() as Checklist;
   assert.equal(checklist.criteria.length, 9);
   await page.getByRole('button', { name: 'Оценка диалогов', exact: true }).click();
-  await page.locator('.assessment > label').first().locator('select').selectOption(checklist.version);
+  await page.getByRole('combobox', { name: 'Чек-лист', exact: true }).selectOption(checklist.version);
   const evaluated = page.waitForResponse(r => r.url().endsWith('/api/evaluations') && r.request().method() === 'POST', { timeout: 140000 });
   await page.getByRole('button', { name: 'Оценить через бесплатную модель', exact: true }).click();
   const evaluatedResponse = await evaluated;
@@ -99,7 +99,7 @@ try {
   assert.equal(history.finalAnswers.C9, 'NO');
   assert.equal(history.finalScore.total, evaluation.score.total);
   await page.reload();
-  await page.getByText('Реальный API', { exact: true }).waitFor();
+  await page.locator('.assessment > .panel-heading .badge').filter({ hasText: 'Реальный API' }).waitFor();
   const originalAfter = await (await page.request.get(`${base}/api/evaluations/${original.id}`)).json();
   assert.deepEqual(originalAfter, original);
   assert.deepEqual(browserErrors, []);

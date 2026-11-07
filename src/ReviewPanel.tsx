@@ -158,7 +158,7 @@ function ReviewPanelContent({ evaluation, checklist, onError }: ReviewPanelProps
           <h4>{appeal.criterionId} · {criterion?.title || appeal.criterionId}</h4>
           <p><time dateTime={appeal.createdAt}>{new Date(appeal.createdAt).toLocaleString('ru')}</time> · {decision ? 'Рассмотрена' : stale ? 'Требует нового обращения' : 'Ожидает решения'}</p>
           <p><strong>Комментарий заявителя:</strong> {appeal.comment}</p>
-          <p>Исходный ответ модели: <strong>{label(appeal.originalAnswer)}</strong>. Оспариваемый ответ: <strong>{label(appeal.contestedAnswer)}</strong>.</p>
+          <p>{evaluation.status === 'live_validated' ? 'Исходный ответ модели' : 'Исходный ответ проверяющего'}: <strong>{label(appeal.originalAnswer)}</strong>. Оспариваемый ответ: <strong>{label(appeal.contestedAnswer)}</strong>.</p>
           <details>
             <summary>Исходное обоснование и доказательства</summary>
             <SourceEvidence result={appeal.originalResult} />

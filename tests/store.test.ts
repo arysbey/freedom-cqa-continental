@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync } from 'node:fs';
+import { removeLocalTemp } from './local-temp.js';
 import { resolve, join } from 'node:path';
 import { Store } from '../server/store.js';
 import { parseOrganizerResponse } from '../server/importer.js';
@@ -89,5 +90,5 @@ test('SQLite data and immutable evaluation links survive close and reopen', () =
     assert.deepEqual(store.getChecklist(checklist.version), checklist);
     assert.deepEqual(store.getConversation(imported.conversations[0].version), imported.conversations[0]);
     assert.deepEqual(store.importDataset(imported), { inserted: 0, unchanged: 1, total: 1 });
-  } finally { store.close(); rmSync(dir, { recursive: true }); }
+  } finally { store.close(); removeLocalTemp(dir); }
 });

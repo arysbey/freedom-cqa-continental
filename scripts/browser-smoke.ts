@@ -17,10 +17,11 @@ try {
   await page.screenshot({ path: 'private/reports/design-options.png', fullPage: true });
   await page.goto(base);
   await page.getByRole('heading', { name: 'p1-ru-001', exact: true }).waitFor();
-  assert.equal(await page.locator('.conversation').count(), 65);
+  const conversations = await (await page.request.get(`${base}/api/conversations`)).json();
+  assert.equal(await page.locator('.conversation').count(), conversations.length);
   const evaluationCount = (await (await page.request.get(`${base}/api/status`)).json()).liveEvaluationCount;
   if (evaluationCount) {
-    await page.getByText('Реальный API', { exact: true }).waitFor();
+    await page.locator('.assessment > .panel-heading .badge').filter({ hasText: 'Реальный API' }).waitFor();
     await page.locator('.criterion').first().click();
     await page.locator('.evidence-link').first().click();
     assert(await page.locator('.message:focus').count() > 0);
@@ -33,7 +34,7 @@ try {
   await page.screenshot({ path: 'private/reports/workspace-mobile.png', fullPage: true });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
   assert.deepEqual(errors, []);
-  const report = { status: 'PASS', source: 'actual-local-backend-no-network-mocks', conversations: 65, savedLiveEvaluations: evaluationCount, browserErrors: errors, screenshots: ['design-options.png', 'workspace-desktop.png', 'workspace-mobile.png'] };
+  const report = { status: 'PASS', source: 'actual-local-backend-no-network-mocks', conversations: conversations.length, devRecords: conversations.filter((c: { groupId: string }) => c.groupId === 'DEV').length, savedLiveEvaluations: evaluationCount, browserErrors: errors, screenshots: ['design-options.png', 'workspace-desktop.png', 'workspace-mobile.png'] };
   writeFileSync('private/reports/browser-smoke.json', JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } finally { await browser.close(); }

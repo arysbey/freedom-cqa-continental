@@ -1,7 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { Checklist, Conversation, Evaluation } from '../src/domain.js';
+import type { Checklist, Conversation, Evaluation, EvaluationAttempt } from '../src/domain.js';
 import { canonicalJson, type ParsedDataset } from './importer.js';
 
 type JsonRow = { json: string };
@@ -10,11 +10,12 @@ type JsonRow = { json: string };
 export class Store {
   private readonly db: DatabaseSync;
 
-  constructor(path: string) {
+  constructor(readonly path: string) {
     if (path !== ':memory:') mkdirSync(dirname(resolve(path)), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec(`
       PRAGMA foreign_keys = ON;
+      PRAGMA busy_timeout = 5000;
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS conversations (
         version TEXT PRIMARY KEY,
@@ -37,6 +38,10 @@ export class Store {
         checklist_version TEXT NOT NULL REFERENCES checklists(version),
         json TEXT NOT NULL,
         created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS evaluation_attempts (
+        id TEXT PRIMARY KEY,
+        json TEXT NOT NULL
       );
     `);
   }
@@ -126,6 +131,23 @@ export class Store {
   getEvaluation(id: string): Evaluation | undefined {
     const row = this.db.prepare('SELECT json FROM evaluations WHERE id = ?').get(id) as JsonRow | undefined;
     return row ? JSON.parse(row.json) as Evaluation : undefined;
+  }
+
+  startEvaluationAttempt(attempt: EvaluationAttempt): void {
+    if (attempt.status !== 'running') throw new Error('INVALID_ATTEMPT_STATE');
+    this.db.prepare('INSERT INTO evaluation_attempts(id,json) VALUES (?,?)').run(attempt.id, canonicalJson(attempt));
+  }
+
+  finishEvaluationAttempt(attempt: EvaluationAttempt): void {
+    const row = this.db.prepare('SELECT json FROM evaluation_attempts WHERE id=?').get(attempt.id) as JsonRow | undefined;
+    const previous = row ? JSON.parse(row.json) as EvaluationAttempt : undefined;
+    if (!previous || previous.status !== 'running' || attempt.status === 'running') throw new Error('INVALID_ATTEMPT_STATE');
+    if (previous.conversationVersion !== attempt.conversationVersion || previous.checklistVersion !== attempt.checklistVersion || previous.model !== attempt.model || previous.startedAt !== attempt.startedAt) throw new Error('IMMUTABLE_ATTEMPT_SOURCE');
+    this.db.prepare('UPDATE evaluation_attempts SET json=? WHERE id=?').run(canonicalJson(attempt), attempt.id);
+  }
+
+  listEvaluationAttempts(): EvaluationAttempt[] {
+    return (this.db.prepare('SELECT json FROM evaluation_attempts ORDER BY rowid DESC').all() as JsonRow[]).map(row => JSON.parse(row.json) as EvaluationAttempt);
   }
 
   close(): void { this.db.close(); }

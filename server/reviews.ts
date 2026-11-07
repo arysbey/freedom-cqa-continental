@@ -71,6 +71,7 @@ export class ReviewStore {
     this.db = new DatabaseSync(path);
     this.db.exec(`
       PRAGMA foreign_keys = ON;
+      PRAGMA busy_timeout = 5000;
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS review_sources (
         evaluation_id TEXT PRIMARY KEY,

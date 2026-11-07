@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync } from 'node:fs';
+import { removeLocalTemp } from './local-temp.js';
 import { join, resolve } from 'node:path';
 import { createApp } from '../server/app.js';
 import { config } from '../server/config.js';
@@ -92,7 +93,7 @@ async function setup() {
   const dbPath = join(dir, 'cqa.sqlite');
   const store = new Store(dbPath);
   const app = await createApp(store, new ReviewStore(dbPath));
-  return { app, store, dbPath, close: async () => { await app.close(); rmSync(dir, { recursive: true }); } };
+  return { app, store, dbPath, close: async () => { await app.close(); removeLocalTemp(dir); } };
 }
 
 test('API status reports configuration booleans without disclosing key or signed endpoint', async () => {

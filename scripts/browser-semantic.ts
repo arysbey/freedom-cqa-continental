@@ -1,0 +1,63 @@
+/** Actual UI change of C9 meaning; never modifies a human reference or a past evaluation. */
+import { chromium } from '@playwright/test';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import assert from 'node:assert/strict';
+import { config } from '../server/config.js';
+import type { Checklist, Evaluation } from '../src/domain.js';
+
+if (config.model !== 'gemini-3.1-flash-lite') throw new Error('MODEL_CHANGE_REQUIRES_USER_APPROVAL');
+const base = `http://127.0.0.1:${config.port}`;
+const chrome = 'C:/Program Files/Google/Chrome/Application/chrome.exe';
+const browser = await chromium.launch({ executablePath: process.env.CQA_BROWSER_EXECUTABLE || (existsSync(chrome) ? chrome : undefined), headless: true });
+const page = await browser.newPage({ viewport: { width: 1540, height: 1000 }, reducedMotion: 'reduce' });
+const browserErrors: string[] = [];
+let phase = 'startup';
+page.on('pageerror', e => browserErrors.push(e.message));
+mkdirSync('private/reports', { recursive: true });
+try {
+  await page.goto(base);
+  phase = 'load-original';
+  const before = await (await page.request.get(`${base}/api/evaluations`)).json() as Evaluation[];
+  const baseline = before.find(e => e.id === 'fcf30c1f-cf45-4314-ac24-00831c66fc0f');
+  assert(baseline && baseline.results.find(r => r.criterionId === 'C9')?.answer === 'NO');
+  await page.getByRole('button', { name: 'Чек-листы', exact: true }).click();
+  phase = 'edit-criterion';
+  await page.getByRole('combobox', { name: 'Основа чек-листа', exact: true }).selectOption(baseline.checklistVersion);
+  const editor = page.getByRole('combobox', { name: 'Редактируемый критерий', exact: true });
+  const optionValue = await editor.locator('option').filter({ hasText: ' · C9' }).getAttribute('value');
+  assert(optionValue); await editor.selectOption(optionValue);
+  await page.getByLabel('Название критерия', { exact: true }).fill('Навигация в веб-версии');
+  await page.getByLabel('Правила оценки', { exact: true }).fill('ДА — человек-оператор дал клиенту конкретный путь в веб-версии: назвал вкладку или раздел и объяснил, где найти нужную информацию. НЕТ — такого конкретного пути в репликах человека-оператора нет. URL не требуется. Реплики бота не засчитываются. Оценивайте только это новое значение критерия.');
+  await page.getByLabel('Требования к доказательствам', { exact: true }).fill('Для ДА приведите точную цитату человека-оператора с названием веб-раздела и указанием места нужной информации. Для НЕТ укажите проверенный диапазон.');
+  const savedResponse = page.waitForResponse(r => r.url().endsWith('/api/checklists') && r.request().method() === 'POST');
+  await page.getByRole('button', { name: 'Сохранить новую версию', exact: true }).click();
+  const saved = await savedResponse; assert(saved.ok()); const checklist = await saved.json() as Checklist;
+  phase = 'select-conversation';
+  await page.getByRole('button', { name: 'Оценка диалогов', exact: true }).click();
+  await page.getByRole('searchbox', { name: 'Поиск диалога', exact: true }).fill('p1-ru-001');
+  await page.locator('.conversation').filter({ hasText: 'p1-ru-001' }).click();
+  phase = 'select-new-checklist';
+  await page.getByRole('combobox', { name: 'Чек-лист', exact: true }).selectOption(checklist.version);
+  const evaluated = page.waitForResponse(r => r.url().endsWith('/api/evaluations') && r.request().method() === 'POST', { timeout: 140000 });
+  phase = 'invoke-model';
+  await page.getByRole('button', { name: 'Оценить через бесплатную модель', exact: true }).click();
+  const resultResponse = await evaluated; const body = await resultResponse.json();
+  phase = 'check-actual-result';
+  assert(resultResponse.ok(), `Actual evaluation failed: ${body.error}`);
+  const evaluation = body as Evaluation;
+  assert.equal(evaluation.model, 'gemini-3.1-flash-lite'); assert.equal(evaluation.status, 'live_validated');
+  const changed = evaluation.results.find(r => r.criterionId === 'C9'); assert(changed); assert.equal(changed.answer, 'YES'); assert(changed.evidence.length > 0);
+  await page.locator('.criterion').filter({ hasText: 'Навигация в веб-версии' }).click();
+  await page.locator('.criterion-details .evidence-link').first().click();
+  assert(await page.locator('.message:focus').count() > 0);
+  const historical = await (await page.request.get(`${base}/api/evaluations/${baseline.id}`)).json(); assert.deepEqual(historical, baseline);
+  assert.deepEqual(browserErrors, []);
+  const report = { status: 'PASS', networkMocks: false, model: evaluation.model, conversation: 'p1-ru-001', originalCriterionMeaning: 'operator supplied help URL', changedCriterionMeaning: 'operator gave concrete web navigation steps', originalAnswer: 'NO', changedAnswer: changed.answer, oldChecklistVersion: baseline.checklistVersion, newChecklistVersion: checklist.version, originalEvaluationId: baseline.id, newEvaluationId: evaluation.id, oldTotal: baseline.score.total, newTotal: evaluation.score.total, evidenceJump: true, originalUnchanged: true, latencyMs: evaluation.latencyMs, providerCallCount: evaluation.providerCallCount, usage: evaluation.usage, humanJudgmentsAuthored: 0, browserErrors };
+  writeFileSync('private/reports/semantic-acceptance.json', JSON.stringify(report, null, 2));
+  await page.screenshot({ path: 'private/reports/semantic-acceptance.png', fullPage: true });
+  console.log(JSON.stringify(report, null, 2));
+} catch (error) {
+  await page.screenshot({ path: 'private/reports/semantic-acceptance-failure.png', fullPage: true }).catch(() => undefined);
+  console.error(JSON.stringify({ status: 'FAIL', phase, code: error instanceof Error && /^[A-Z][A-Z0-9_]{0,80}$/.test(error.message) ? error.message : 'SEMANTIC_ACCEPTANCE_FAILED', summary: error instanceof Error ? error.message.split('\n')[0].slice(0, 180) : '' }));
+  process.exitCode = 1;
+} finally { await browser.close(); }

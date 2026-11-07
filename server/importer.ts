@@ -3,6 +3,9 @@ import { z } from 'zod';
 import type { Classification, Conversation } from '../src/domain.js';
 
 const MAX_RESPONSE_BYTES = 15 * 1024 * 1024;
+export class OrganizerImportError extends Error {
+  constructor(readonly code: string, message: string, readonly upstreamStatus?: number) { super(message); }
+}
 const ORGANIZER_HOST = 'ec88f21f1accecf38e20095a9fe175.a5.environment.api.powerplatform.com';
 const ORGANIZER_PATH = '/powerautomate/automations/direct/cu/11/workflows/b3d2a68006a24662be2b721454cb4e00/triggers/manual/paths/invoke';
 
@@ -134,13 +137,13 @@ export function isApprovedSyntheticConversation(conversation: Conversation): boo
 export function parseOrganizerResponse(input: unknown, expectedGroup?: string): ParsedDataset {
   // Never include Zod issue values, endpoint responses, or signed URLs in errors.
   const parsed = responseSchema.safeParse(input);
-  if (!parsed.success) throw new Error('Organizer response does not match the expected schema.');
+  if (!parsed.success) throw new OrganizerImportError('IMPORT_SCHEMA_INVALID', 'Organizer response does not match the expected schema.');
   const envelope = parsed.data;
-  if (!envelope.isSuccess || envelope.error.trim()) throw new Error('Organizer reported an unsuccessful import.');
+  if (!envelope.isSuccess || envelope.error.trim()) throw new OrganizerImportError('IMPORT_REJECTED', 'Organizer reported an unsuccessful import.');
   const data = envelope.data;
-  if (expectedGroup !== undefined && data.dataset_group_id !== expectedGroup) throw new Error('Organizer returned a different dataset group.');
-  if (data.total_records !== data.records.length) throw new Error('Organizer record count does not match the response.');
-  if (new Set(data.records.map(record => record.conversation_id)).size !== data.records.length) throw new Error('Duplicate conversation IDs in one import.');
+  if (expectedGroup !== undefined && data.dataset_group_id !== expectedGroup) throw new OrganizerImportError('IMPORT_GROUP_MISMATCH', 'Organizer returned a different dataset group.');
+  if (data.total_records !== data.records.length) throw new OrganizerImportError('IMPORT_COUNT_MISMATCH', 'Organizer record count does not match the response.');
+  if (new Set(data.records.map(record => record.conversation_id)).size !== data.records.length) throw new OrganizerImportError('IMPORT_DUPLICATE_IDS', 'Duplicate conversation IDs in one import.');
   const groupId = data.dataset_group_id;
   const originals = structuredClone(data.records);
   const conversations: Conversation[] = data.records.map(record => {
@@ -169,20 +172,20 @@ export function parseOrganizerResponse(input: unknown, expectedGroup?: string): 
 }
 
 export async function fetchOrganizerGroup(endpoint: string, groupId: string, timeoutMs = 30_000): Promise<ParsedDataset> {
-  if (!groupId.trim() || groupId.length > 128) throw new Error('Invalid dataset group.');
+  if (!groupId.trim() || groupId.length > 128) throw new OrganizerImportError('IMPORT_GROUP_INVALID', 'Invalid dataset group.');
   let url: URL;
-  try { url = new URL(endpoint); } catch { throw new Error('Organizer endpoint is not configured correctly.'); }
+  try { url = new URL(endpoint); } catch { throw new OrganizerImportError('IMPORT_NOT_CONFIGURED', 'Organizer endpoint is not configured correctly.'); }
   if (url.protocol !== 'https:' || url.hostname !== ORGANIZER_HOST || url.pathname !== ORGANIZER_PATH || url.username || url.password || url.port) {
-    throw new Error('Organizer endpoint must use the approved HTTPS host and path.');
+    throw new OrganizerImportError('IMPORT_ENDPOINT_RESTRICTED', 'Organizer endpoint must use the approved HTTPS host and path.');
   }
   url.searchParams.set('group_id', groupId);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(100, Math.min(timeoutMs, 60_000)));
   try {
     const response = await fetch(url, { signal: controller.signal, redirect: 'error', headers: { accept: 'application/json' } });
-    if (!response.ok) throw new Error(`Organizer HTTP status ${response.status}.`);
-    if (Number(response.headers.get('content-length')) > MAX_RESPONSE_BYTES) throw new Error('Organizer response exceeds the size limit.');
-    if (!response.body) throw new Error('Organizer response has no body.');
+    if (!response.ok) throw new OrganizerImportError('IMPORT_HTTP_ERROR', `Organizer HTTP status ${response.status}.`, response.status);
+    if (Number(response.headers.get('content-length')) > MAX_RESPONSE_BYTES) throw new OrganizerImportError('IMPORT_TOO_LARGE', 'Organizer response exceeds the size limit.');
+    if (!response.body) throw new OrganizerImportError('IMPORT_EMPTY_RESPONSE', 'Organizer response has no body.');
     const chunks: Uint8Array[] = [];
     let bytes = 0;
     const reader = response.body.getReader();
@@ -194,7 +197,7 @@ export async function fetchOrganizerGroup(endpoint: string, groupId: string, tim
         if (bytes > MAX_RESPONSE_BYTES) {
           controller.abort();
           await reader.cancel();
-          throw new Error('Organizer response exceeds the size limit.');
+          throw new OrganizerImportError('IMPORT_TOO_LARGE', 'Organizer response exceeds the size limit.');
         }
         chunks.push(next.value);
       }
@@ -202,13 +205,13 @@ export async function fetchOrganizerGroup(endpoint: string, groupId: string, tim
       reader.releaseLock();
     }
     let input: unknown;
-    try { input = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new Error('Organizer returned invalid JSON.'); }
+    try { input = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new OrganizerImportError('IMPORT_JSON_INVALID', 'Organizer returned invalid JSON.'); }
     return parseOrganizerResponse(input, groupId);
   } catch (error) {
-    if (controller.signal.aborted) throw new Error('Organizer import timed out or exceeded its size limit.');
+    if (error instanceof OrganizerImportError) throw error;
+    if (controller.signal.aborted) throw new OrganizerImportError('IMPORT_TIMEOUT', 'Organizer import timed out or exceeded its size limit.');
     // Keep our own safe errors; networking exceptions may contain the signed URL.
-    if (error instanceof Error && /^(Organizer|Duplicate)/.test(error.message)) throw error;
-    throw new Error('Organizer request failed; endpoint details are hidden.');
+    throw new OrganizerImportError('IMPORT_NETWORK_FAILED', 'Organizer request failed; endpoint details are hidden.');
   } finally {
     clearTimeout(timer);
   }

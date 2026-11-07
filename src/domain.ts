@@ -47,12 +47,27 @@ export interface Evaluation {
   checklistVersion: string;
   provider: string;
   model: string;
-  mode: 'free';
-  status: 'live_validated';
+  mode: 'free' | 'local';
+  status: 'live_validated' | 'human_entered' | 'manual_demo';
+  origin?: 'ai' | 'human' | 'agent_demo';
+  reviewer?: string;
   results: CriterionResult[];
   score: Score;
   usage: Record<string, number | null>;
   latencyMs: number;
   providerCallCount: number;
   configuration: Record<string, unknown>;
+}
+export interface EvaluationAttempt {
+  id: string;
+  conversationVersion: string;
+  checklistVersion: string;
+  model: string;
+  startedAt: string;
+  finishedAt: string | null;
+  status: 'running' | 'succeeded' | 'failed';
+  evaluationId: string | null;
+  errorCode: string | null;
+  latencyMs: number | null;
+  usage: Record<string, number | null> | null;
 }

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { mkdtempSync, mkdirSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { removeLocalTemp } from './local-temp.js';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { initialChecklist } from '../src/checklist.js';
@@ -170,7 +170,8 @@ test('appeals cannot be reviewed using a different evaluation', () => {
 });
 
 test('persistent audit survives database close/reopen and SQL UPDATE/DELETE is blocked', () => {
-  const directory = mkdtempSync(join(tmpdir(), 'cqa-reviews-'));
+  mkdirSync(resolve('tmp/tests'), { recursive: true });
+  const directory = mkdtempSync(join(resolve('tmp/tests'), 'cqa-reviews-'));
   const path = join(directory, 'reviews.sqlite');
   let store: ReviewStore | undefined = new ReviewStore(path);
   try {
@@ -190,7 +191,7 @@ test('persistent audit survives database close/reopen and SQL UPDATE/DELETE is b
     } finally { db.close(); }
   } finally {
     store?.close();
-    rmSync(directory, { recursive: true, force: true });
+    removeLocalTemp(directory);
   }
 });
 
