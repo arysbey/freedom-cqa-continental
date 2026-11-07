@@ -80,3 +80,30 @@ test('output JSON schema constrains references to this conversation message IDs'
   const schema = JSON.stringify(evaluationJsonSchema(checklist, ['v1:0', 'v1:1', 'v1:2']));
   assert.equal((schema.match(/"enum":\["v1:0","v1:1","v1:2"\]/g) ?? []).length, 3);
 });
+
+test('strict generation requires an object source span for all criteria without changing legacy inbound evidence rules', () => {
+  const rubric = { ...checklist, criteria: Array.from({ length: 8 }, (_, i) => ({ ...checklist.criteria[0], id: `C${i + 1}` })) };
+  const strict = evaluationJsonSchema(rubric, conversation.messages.map(m => m.id), { requireCheckedRange: true }) as { properties: { results: { minItems: number; maxItems: number; items: { required: string[]; properties: { checkedRange: { type: unknown; required: string[]; properties: { startMessageId: { enum: string[] }; endMessageId: { enum: string[] } } } } } } } };
+  assert.equal(strict.properties.results.minItems, 8); assert.equal(strict.properties.results.maxItems, 8);
+  const span = strict.properties.results.items.properties.checkedRange;
+  assert.equal(span.type, 'object'); assert.deepEqual(span.required, ['startMessageId', 'endMessageId']);
+  assert.deepEqual(span.properties.startMessageId.enum, ['v1:0', 'v1:1', 'v1:2']); assert.deepEqual(span.properties.endMessageId.enum, ['v1:0', 'v1:1', 'v1:2']);
+  assert(strict.properties.results.items.required.includes('checkedRange'));
+  assert.equal(inspect(result({ checkedRange: null }))[0].answer, 'YES');
+  assert.throws(() => inspect(result({ answer: 'NO', checkedRange: null })), /checked range/);
+  assert.throws(() => inspect(result({ checkedRange: { startMessageId: 'v1:2', endMessageId: 'v1:0' } })), /range/);
+  assert.throws(() => inspect(result({ evidence: [{ messageId: 'v1:1', quote: 'invented quote' }], checkedRange: range })), /quotation/);
+  assert.match(JSON.stringify(evaluationJsonSchema(checklist)), /"type":\["object","null"\]/);
+});
+
+test('copy-guided schema uses the simple range shape while local validation preserves source-ID correspondence', () => {
+  const ids = conversation.messages.map(m => m.id);
+  const schema = evaluationJsonSchema(checklist, ids, { requireCheckedRange: true }) as { properties: { results: { items: { properties: { evidence: { items: { type: string; required: string[]; properties: { messageId: { enum: string[] }; quote: { type: string; description: string; enum?: string[] } } } } } } } } };
+  const item = schema.properties.results.items.properties.evidence.items;
+  assert.equal(item.type, 'object'); assert.deepEqual(item.required, ['messageId', 'quote']);
+  assert.deepEqual(item.properties.messageId.enum, ids); assert.equal(item.properties.quote.type, 'string'); assert.equal(item.properties.quote.enum, undefined);
+  assert.match(item.properties.quote.description, /complete text/); assert.match(item.properties.quote.description, /punctuation/); assert.match(item.properties.quote.description, /whitespace/); assert.match(item.properties.quote.description, /ellipses/);
+  assert(!JSON.stringify(schema).includes('anyOf')); assert(!JSON.stringify(schema).includes(conversation.messages[1].text));
+  assert.equal(inspect(result({ evidence: [{ messageId: 'v1:1', quote: 'Менің атым Айдана.' }] }))[0].evidence[0].quote, 'Менің атым Айдана.');
+  assert.throws(() => inspect(result({ evidence: [{ messageId: 'v1:0', quote: 'Менің атым Айдана.' }] })), /quotation/);
+});

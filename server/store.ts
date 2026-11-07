@@ -169,7 +169,7 @@ export class Store {
   }
 
   private assertAttemptSource(previous: EvaluationAttempt, attempt: EvaluationAttempt): void {
-    if (previous.conversationVersion !== attempt.conversationVersion || previous.checklistVersion !== attempt.checklistVersion || previous.model !== attempt.model || previous.startedAt !== attempt.startedAt || (previous.recoveryOf ?? null) !== (attempt.recoveryOf ?? null) || (previous.recoveryDepth ?? 0) !== (attempt.recoveryDepth ?? 0) || (previous.requestId ?? null) !== (attempt.requestId ?? null)) throw new Error('IMMUTABLE_ATTEMPT_SOURCE');
+    if (previous.conversationVersion !== attempt.conversationVersion || previous.checklistVersion !== attempt.checklistVersion || previous.model !== attempt.model || previous.startedAt !== attempt.startedAt || (previous.recoveryOf ?? null) !== (attempt.recoveryOf ?? null) || (previous.recoveryDepth ?? 0) !== (attempt.recoveryDepth ?? 0) || (previous.requestId ?? null) !== (attempt.requestId ?? null) || (previous.executorPid ?? null) !== (attempt.executorPid ?? null) || (previous.executorSessionId ?? null) !== (attempt.executorSessionId ?? null)) throw new Error('IMMUTABLE_ATTEMPT_SOURCE');
   }
 
   finishEvaluationAttempt(attempt: EvaluationAttempt): void {

@@ -64,7 +64,7 @@ export function validateEvidence(conversation: Conversation, checklist: Checklis
 }
 
 /** A compact API-supported JSON Schema; criterion-specific values are checked locally too. */
-export function evaluationJsonSchema(checklist: Checklist, messageIds?: string[]): Record<string, unknown> {
+export function evaluationJsonSchema(checklist: Checklist, messageIds?: string[], options: { requireCheckedRange?: boolean } = {}): Record<string, unknown> {
   const sourceId = { type: 'string', ...(messageIds?.length && messageIds.length <= 500 ? { enum: messageIds } : {}), description: 'An exact stable message ID copied from this source conversation.' };
   return {
     type: 'object', additionalProperties: false, required: ['results'],
@@ -79,11 +79,11 @@ export function evaluationJsonSchema(checklist: Checklist, messageIds?: string[]
             answer: { type: 'string', enum: [...new Set(checklist.criteria.flatMap(c => [...c.allowedValues, ...(c.naAllowed ? ['N/A'] : [])]))] },
             applicabilityRationale: { type: 'string' }, explanation: { type: 'string' },
             evidence: {
-              type: 'array', items: { type: 'object', additionalProperties: false, required: ['messageId', 'quote'], properties: { messageId: sourceId, quote: { type: 'string', description: 'An exact nonempty source substring, with no added quotation marks, paraphrase or ellipsis.' } } },
+              type: 'array', items: { type: 'object', additionalProperties: false, required: ['messageId', 'quote'], properties: { messageId: sourceId, quote: { type: 'string', description: 'Copy the complete text of the selected source message exactly, preserving punctuation, capitalization, whitespace and line breaks. Do not paraphrase, add quotation marks or use ellipses. The messageId must identify that same source message.' } } },
             },
             checkedRange: {
-              type: ['object', 'null'], additionalProperties: false, required: ['startMessageId', 'endMessageId'],
-              description: 'Required for every NO, partial numeric answer and N/A. Identify the ordered inclusive source range actually inspected.',
+              type: options.requireCheckedRange ? 'object' : ['object', 'null'], additionalProperties: false, required: ['startMessageId', 'endMessageId'],
+              description: options.requireCheckedRange ? 'Required for every criterion and answer. Identify the ordered inclusive source range actually inspected, using exact source message IDs.' : 'Required for every NO, partial numeric answer and N/A. Identify the ordered inclusive source range actually inspected.',
               properties: { startMessageId: sourceId, endMessageId: sourceId },
             },
             reviewRequired: { type: 'boolean' }, uncertainty: { type: 'string' },

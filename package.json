@@ -13,7 +13,11 @@
     "lint": "eslint .",
     "import:dev": "tsx scripts/import-dev.ts",
     "models": "tsx scripts/models.ts",
-    "evaluate:first": "tsx scripts/evaluate-first.ts"
+    "evaluate:first": "tsx scripts/evaluate-first.ts",
+    "score:group": "tsx scripts/run-group.ts",
+    "results:export": "tsx scripts/export-results.ts",
+    "results:validate": "tsx scripts/validate-results.ts",
+    "rehearse:prod": "tsx scripts/rehearse-prod.ts"
   },
   "dependencies": {
     "@google/genai": "^2.3.0",

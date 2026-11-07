@@ -1,0 +1,126 @@
+{
+  "error": "",
+  "isSuccess": true,
+  "software_test_fixture": true,
+  "purpose": "LOCAL_REHEARSAL_ONLY. Invented synthetic source records for isolated software tests; never the organizer PROD dataset. No gold labels or scores.",
+  "data": {
+    "dataset_group_id": "LOCAL_REHEARSAL_10",
+    "total_records": 10,
+    "records": [
+      {
+        "conversation_id": "LOCAL_REHEARSAL_RU_01",
+        "channel": "agent chat", "language": "RU", "audio_url": null,
+        "transcript": [
+          { "timestamp": "00:00", "speaker": "system", "text": "LOCAL_REHEARSAL_ONLY: полностью вымышленный программный сценарий." },
+          { "timestamp": "00:00", "speaker": "client", "text": "Где в учебном кабинете посмотреть тариф?" },
+          { "timestamp": "00:00", "speaker": "bot", "text": "Здравствуйте! Я учебный бот." },
+          { "timestamp": "00:10", "speaker": "operator", "text": "Здравствуйте! Я Дана. В учебной веб-версии откройте «Кабинет», затем «Тарифы»." },
+          { "timestamp": "00:20", "speaker": "client", "text": "Нашёл, спасибо." },
+          { "timestamp": "00:25", "speaker": "operator", "text": "Тариф находится в разделе «Тарифы». Могу помочь ещё с чем-нибудь? До свидания!" }
+        ]
+      },
+      {
+        "conversation_id": "LOCAL_REHEARSAL_RU_02",
+        "channel": "agent chat", "language": "RU", "audio_url": null,
+        "transcript": [
+          { "timestamp": "00:00", "speaker": "system", "text": "LOCAL_REHEARSAL_ONLY: вымышленная учётная запись LOCAL_ACCOUNT, без персональных данных." },
+          { "timestamp": "00:01", "speaker": "client", "text": "Хочу изменить учебный номер телефона в LOCAL_ACCOUNT." },
+          { "timestamp": "00:05", "speaker": "operator", "text": "Здравствуйте, я Алия. Перед изменением нужен учебный процесс подтверждения личности. Подтвердите его в демонстрационной форме." },
+          { "timestamp": "00:15", "speaker": "system", "text": "LOCAL_VERIFICATION_COMPLETE: учебное подтверждение завершено." },
+          { "timestamp": "00:20", "speaker": "operator", "text": "Подтверждение завершено. Изменение учебного контакта выполняется в «Профиль» → «Контакты»." },
+          { "timestamp": "00:30", "speaker": "client", "text": "Понятно." },
+          { "timestamp": "00:35", "speaker": "operator", "text": "Мы нашли нужный раздел. Остались вопросы? До свидания." }
+        ]
+      },
+      {
+        "conversation_id": "LOCAL_REHEARSAL_RU_03",
+        "channel": "agent chat", "language": "RU", "audio_url": null,
+        "transcript": [
+          { "timestamp": "00:00", "speaker": "system", "text": "LOCAL_REHEARSAL_ONLY: вымышленный сценарий нескольких вопросов." },
+          { "timestamp": "00:02", "speaker": "client", "text": "Где посмотреть учебную комиссию и как отменить учебную заявку?" },
+          { "timestamp": "00:08", "speaker": "operator", "text": "Здравствуйте, я Арман. Комиссии перечислены в учебном разделе «Тарифы»." },
+          { "timestamp": "00:14", "speaker": "client", "text": "А как отменить заявку?" },
+          { "timestamp": "00:25", "speaker": "system", "text": "Учебный сеанс прерван: соединение клиента потеряно." }
+        ]
+      },
+      {
+        "conversation_id": "LOCAL_REHEARSAL_RU_04",
+        "channel": "agent chat", "language": "RU", "audio_url": null,
+        "transcript": [
+          { "timestamp": "00:00", "speaker": "system", "text": "LOCAL_REHEARSAL_ONLY: вымышленная жалоба; реальных операций нет." },
+          { "timestamp": "00:02", "speaker": "client", "text": "Уже второй раз не могу найти учебный отчёт, это раздражает." },
+          { "timestamp": "00:10", "speaker": "operator", "text": "Здравствуйте, я Салтанат. Понимаю, повторный поиск отчёта неудобен. Помогу найти его: «Документы» → «Учебные отчёты»." },
+          { "timestamp": "00:20", "speaker": "client", "text": "Теперь вижу, спасибо." },
+          { "timestamp": "00:25", "speaker": "operator", "text": "Отчёт найден в «Учебных отчётах». Нужна дополнительная помощь? До свидания!" }
+        ]
+      },
+      {
+        "conversation_id": "LOCAL_REHEARSAL_KZ_01",
+        "channel": "agent chat", "language": "KZ", "audio_url": null,
+        "transcript": [
+          { "timestamp": "00:00", "speaker": "system", "text": "LOCAL_REHEARSAL_ONLY: толықтай ойдан шығарылған оқу сценарийі." },
+          { "timestamp": "00:01", "speaker": "client", "text": "Оқу кабинетінде тарифтерді қайдан табамын?" },
+          { "timestamp": "00:02", "speaker": "bot", "text": "Сәлеметсіз бе! Мен оқу ботымын." },
+          { "timestamp": "00:10", "speaker": "operator", "text": "Оқу веб-нұсқасында «Кабинет» бөлімін, содан кейін «Тарифтер» бетін ашыңыз." },
+          { "timestamp": "00:18", "speaker": "client", "text": "Таптым, рақмет." },
+          { "timestamp": "00:22", "speaker": "operator", "text": "Тағы көмектесе аламын ба? Сау болыңыз!" }
+        ]
+      },
+      {
+        "conversation_id": "LOCAL_REHEARSAL_KZ_02",
+        "channel": "agent chat", "language": "KZ", "audio_url": null,
+        "transcript": [
+          { "timestamp": "00:00", "speaker": "system", "text": "LOCAL_REHEARSAL_ONLY: операторға қосылмай тұрып үзілетін оқу сеансы." },
+          { "timestamp": "00:01", "speaker": "client", "text": "Оқу қосымшасы туралы сұрағым бар." },
+          { "timestamp": "00:02", "speaker": "bot", "text": "Сәлеметсіз бе! Операторды шақырып жатырмын." },
+          { "timestamp": "00:09", "speaker": "system", "text": "Оқу сеансы үзілді. Адам оператордың жауабы болған жоқ." }
+        ]
+      },
+      {
+        "conversation_id": "LOCAL_REHEARSAL_KZ_03",
+        "channel": "agent chat", "language": "KZ", "audio_url": null,
+        "transcript": [
+          { "timestamp": "00:00", "speaker": "system", "text": "LOCAL_REHEARSAL_ONLY: қауіпсіздік мәселесін тексеруге арналған ойдан шығарылған мәтін; нақты құпиясөз жоқ." },
+          { "timestamp": "00:01", "speaker": "client", "text": "Оқу кабинетінің ашық анықтамасын қайдан оқимын?" },
+          { "timestamp": "00:05", "speaker": "operator", "text": "Сәлеметсіз бе, мен Даниярмын. Алдымен жеке құпиясөзіңізді осы чатқа жазыңыз." },
+          { "timestamp": "00:12", "speaker": "client", "text": "Құпиясөзді бермеймін. Ашық анықтама ғана керек." },
+          { "timestamp": "00:20", "speaker": "operator", "text": "Анықтама оқу мәзіріндегі «Көмек» бөлімінде." }
+        ]
+      },
+      {
+        "conversation_id": "LOCAL_REHEARSAL_EN_01",
+        "channel": "agent chat", "language": "EN", "audio_url": null,
+        "transcript": [
+          { "timestamp": "00:00", "speaker": "system", "text": "LOCAL_REHEARSAL_ONLY: invented software fixture with intentionally duplicate timestamps." },
+          { "timestamp": "00:00", "speaker": "client", "text": "Where can I find the training fee schedule?" },
+          { "timestamp": "00:00", "speaker": "bot", "text": "Hello, I am the training bot." },
+          { "timestamp": "00:00", "speaker": "operator", "text": "Hello, I am Dana. Open Training account, then Fees." },
+          { "timestamp": "00:00", "speaker": "client", "text": "I found it." },
+          { "timestamp": "00:00", "speaker": "operator", "text": "The schedule is under Fees. Is there anything else I can help with? Goodbye." }
+        ]
+      },
+      {
+        "conversation_id": "LOCAL_REHEARSAL_EN_02",
+        "channel": "agent chat", "language": "EN", "audio_url": null,
+        "transcript": [
+          { "timestamp": "00:00", "speaker": "system", "text": "LOCAL_REHEARSAL_ONLY: invented multi-question training conversation, not financial advice." },
+          { "timestamp": "00:02", "speaker": "client", "text": "Where are the training fees and how do I cancel a training order?" },
+          { "timestamp": "00:07", "speaker": "operator", "text": "Hello, I am Aliya. Training fees are listed under Fees." },
+          { "timestamp": "00:14", "speaker": "client", "text": "What about cancelling the training order?" },
+          { "timestamp": "00:21", "speaker": "operator", "text": "Please check the Fees page." }
+        ]
+      },
+      {
+        "conversation_id": "LOCAL_REHEARSAL_EN_03",
+        "channel": "agent chat", "language": "EN", "audio_url": null,
+        "transcript": [
+          { "timestamp": "00:00", "speaker": "system", "text": "LOCAL_REHEARSAL_ONLY: invented mixed-language training conversation." },
+          { "timestamp": "00:01", "speaker": "client", "text": "Здравствуйте. Can we continue in English? I cannot find the training documents." },
+          { "timestamp": "00:09", "speaker": "operator", "text": "Hello, I am Dana. Yes, we can use English. Open Training account, then Documents." },
+          { "timestamp": "00:18", "speaker": "client", "text": "Thank you, I see them now." },
+          { "timestamp": "00:23", "speaker": "operator", "text": "The documents are under Documents. May I help with anything else? Goodbye." }
+        ]
+      }
+    ]
+  }
+}

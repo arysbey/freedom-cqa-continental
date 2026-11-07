@@ -15,11 +15,14 @@ import { saveManualEvaluation } from './manual.js';
 import { AudioService, AudioError } from './audio.js';
 import { PermissionStore } from './data-permissions.js';
 import { publicAttempt } from './recovery.js';
+import { registerSubmissionRoutes } from './submission-app.js';
+import { getProviderConfigurationIdentity } from './provider.js';
 
-export async function createApp(store = new Store(config.dbPath), reviews = new ReviewStore(':memory:'), quality = new QualityStore(':memory:'), permissions = new PermissionStore(store.path)) {
+export async function createApp(store = new Store(config.dbPath), reviews = new ReviewStore(':memory:'), quality = new QualityStore(':memory:'), permissions = new PermissionStore(store.path), options: { submissionWorkspaceRoot?: string } = {}) {
   const app = Fastify({ logger: false, bodyLimit: 1024 * 1024 });
   const audio = new AudioService(store);
   store.saveChecklist(initialChecklist);
+  registerSubmissionRoutes(app, store, permissions, { workspaceRoot: options.submissionWorkspaceRoot });
   app.addHook('onRequest', async (req, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Referrer-Policy', 'no-referrer');
@@ -42,13 +45,20 @@ export async function createApp(store = new Store(config.dbPath), reviews = new 
     const runConflict = code === 'IDEMPOTENCY_CONFLICT' && req.url.split('?')[0] === '/api/evaluations';
     reply.code(runConflict || ['EVALUATION_BUSY', 'RECOVERY_ALREADY_STARTED', 'RECOVERY_LIMIT_REACHED'].includes(code) ? 409 : 400).send({ error: code, ...(attempt ? { attempt, recovery: attempt.recovery } : {}) });
   });
-  app.get('/api/status', async () => ({
+  app.get('/api/status', async () => {
+    const identity = getProviderConfigurationIdentity(config);
+    return ({
     phase: 'next-implementation', provider: config.provider, model: config.model, mode: config.mode,
     apiKeyPresent: Boolean(config.apiKey), freeTierConfirmed: config.freeTierConfirmed,
     organizerConfigured: Boolean(config.organizerUrl),
+    configurationFingerprint: identity.configurationFingerprint,
+    generationConstraintVersion: 'generationConstraintVersion' in identity ? identity.generationConstraintVersion : null,
+    compatiblePreviousFingerprint: 'compatiblePreviousFingerprint' in identity ? identity.compatiblePreviousFingerprint : null,
+    compatibleSourceSpanFingerprint: 'compatibleSourceSpanFingerprint' in identity ? identity.compatibleSourceSpanFingerprint : null,
     liveEvaluationCount: store.listEvaluations().filter(e => e.status === 'live_validated').length,
     manualEvaluationCount: store.listEvaluations().filter(e => e.status !== 'live_validated').length,
-  }));
+    });
+  });
   app.get('/api/conversations', async () => store.listConversations().map(source => permissions.resolve(source)).map(c => ({
     version: c.version, groupId: c.groupId, conversationId: c.conversationId, language: c.language,
     channel: c.channel, classification: c.classification, messageCount: c.messages.length, audioAvailable: c.audioAvailable,

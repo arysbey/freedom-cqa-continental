@@ -1,0 +1,20 @@
+.submission-workspace { max-width: 1200px; margin: 0 auto; padding: 28px; }
+.submission-card { margin-top: 20px; padding: 24px; border: 1px solid var(--line, #d6ddcf); border-radius: 12px; background: #fafbf7; }
+.submission-card h2 { margin: 0 0 14px; font-size: 22px; }
+.submission-controls { display: grid; grid-template-columns: 1fr 1fr .8fr auto auto; gap: 12px; align-items: end; }
+.submission-card label { display: grid; gap: 6px; margin: 10px 0; font-size: 13px; }
+.submission-card input:not([type=checkbox]), .submission-card select, .submission-card textarea { width: 100%; padding: 11px; border: 1px solid #c3ceb9; border-radius: 6px; background: white; color: inherit; font: inherit; }
+.submission-card button, .submission-download { padding: 12px 16px; border: 1px solid #bccbb1; border-radius: 6px; background: #f0f5ea; color: #183e32; font: inherit; font-size: 13px; cursor: pointer; }
+.submission-card .primary { background: #236344; color: white; border-color: #236344; font-weight: 600; }
+.submission-card button:disabled, .submission-download[aria-disabled=true] { opacity: .5; cursor: default; pointer-events: none; }
+.submission-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0; align-items: center; }
+.submission-records { margin: 12px 0; padding: 0; list-style: none; max-height: 340px; overflow: auto; }
+.submission-records li { display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; border-bottom: 1px solid #e3e8dc; padding: 10px 0; font-size: 12px; overflow-wrap: anywhere; }
+.submission-records code { font-size: inherit; }
+.submission-records span { max-width: 75%; overflow-wrap: anywhere; }
+.submission-card .checkbox-label { display: flex; align-items: flex-start; gap: 10px; line-height: 1.6; }
+.submission-card .checkbox-label input { flex-shrink: 0; margin-top: 5px; }
+.submission-counts { font-size: 20px; color: #1c573c; font-weight: 600; }
+.submission-card details summary { cursor: pointer; padding: 10px 0; }
+@media (max-width: 900px) { .submission-controls { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 600px) { .submission-workspace { padding: 16px; } .submission-card { padding: 16px; } .submission-controls { grid-template-columns: 1fr; } .submission-records span { max-width: 100%; } .submission-actions > * { width: 100%; } }

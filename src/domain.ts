@@ -65,6 +65,8 @@ export interface EvaluationAttempt {
   requestId?: string;
   recoveryOf?: string;
   recoveryDepth?: number;
+  executorPid?: number;
+  executorSessionId?: string;
   telemetry?: ProviderTelemetry;
   conversationVersion: string;
   checklistVersion: string;

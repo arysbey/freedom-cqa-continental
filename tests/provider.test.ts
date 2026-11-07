@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import type { Checklist, Conversation } from '../src/domain.js';
 import { GeminiProvider, getProviderConfigurationIdentity, getProviderTelemetry, minimizeConversation, safeProviderFailure, type ProviderConfig, type ProviderTelemetry, type ProviderTransport } from '../server/provider.js';
 
@@ -232,4 +233,64 @@ test('semantic identity is stable across transport recovery and excludes credent
   assert.deepEqual(before, recovered); assert.match(before.configurationFingerprint, /^[a-f0-9]{64}$/);
   assert.equal(before.promptVersion, 'evidence-first-v2'); assert.equal(before.schemaVersion, 'criterion-evidence-v1');
   assert.equal(JSON.stringify(before).includes(config.apiKey!), false);
+});
+
+test('provider requests a required range object and records the exact prior configuration fingerprint without changing the prompt', async () => {
+  let systemInstruction = ''; let schema: Record<string, unknown> = {};
+  const result = await new GeminiProvider(config, { ...transport, generate: async request => { systemInstruction = request.systemInstruction; schema = request.schema; return transport.generate(request); } }).evaluate(conversation, checklist);
+  const rangeSchema = (schema as { properties: { results: { items: { properties: { checkedRange: { type: unknown } } } } } }).properties.results.items.properties.checkedRange;
+  assert.equal(rangeSchema.type, 'object');
+  const legacySemantic = { provider: config.provider, model: config.model, mode: config.mode, api: 'generateContent', thinkingLevel: 'LOW', maxOutputTokens: 10000, promptVersion: 'evidence-first-v2', schemaVersion: 'criterion-evidence-v1', minimizationVersion: 'source-redaction-v1', systemInstruction };
+  const previous = createHash('sha256').update(JSON.stringify(legacySemantic)).digest('hex');
+  assert.equal(result.configuration.compatiblePreviousFingerprint, previous);
+  assert.notEqual(result.configuration.configurationFingerprint, previous);
+  assert.equal(result.configuration.generationConstraintVersion, 'all-criteria-source-span-copy-quotes-v4');
+  assert.equal(result.telemetry.generationConstraintVersion, 'all-criteria-source-span-copy-quotes-v4'); assert.equal(result.telemetry.compatiblePreviousFingerprint, previous);
+  assert.equal(result.configuration.compatibleSourceSpanFingerprint, createHash('sha256').update(JSON.stringify({ ...legacySemantic, generationConstraintVersion: 'all-criteria-source-span-v1' })).digest('hex'));
+  assert.equal(result.configuration.compatibleExactQuotesFingerprint, createHash('sha256').update(JSON.stringify({ ...legacySemantic, generationConstraintVersion: 'all-criteria-source-span-exact-quotes-v2' })).digest('hex'));
+  assert.equal(result.configuration.compatibleFlatQuotesFingerprint, createHash('sha256').update(JSON.stringify({ ...legacySemantic, generationConstraintVersion: 'all-criteria-source-span-flat-quotes-v3' })).digest('hex'));
+  assert.equal(result.configuration.generationCompatibilityScope, 'configuration-transition-only-not-vendor-acceptance');
+  assert.equal(result.configuration.promptVersion, 'evidence-first-v2'); assert.equal(result.configuration.thinkingLevel, 'LOW');
+});
+
+test('copy-guided schema contains no source texts while full minimized evidence restores the original locally', async () => {
+  const source = { ...conversation, messages: [{ ...conversation.messages[0], text: 'Пишите software@example.test. Откройте https://example.test/info?sig=software-only-token.' }] };
+  let sentSchema = ''; let sentText = '';
+  const result = await new GeminiProvider(config, { ...transport, generate: async request => {
+    sentSchema = JSON.stringify(request.schema); sentText = request.contents;
+    const parsed = JSON.parse(request.contents);
+    const schema = request.schema as { properties: { results: { items: { properties: { evidence: { items: { properties: { messageId: { enum: string[] }; quote: { enum: string[] } } } } } } } } };
+    const pair = schema.properties.results.items.properties.evidence.items;
+    assert.deepEqual(pair.properties.messageId.enum, [source.messages[0].id]); assert.equal(pair.properties.quote.enum, undefined);
+    return { text: JSON.stringify(output(parsed.conversation.messages[0].text)) };
+  } }).evaluate(source, checklist);
+  for (const sent of [sentSchema, sentText]) { assert(!sent.includes('software@example.test')); assert(!sent.includes('sig=software-only-token')); }
+  assert(sentText.includes('REDACTED_')); assert(!sentSchema.includes('REDACTED_')); assert(!sentSchema.includes('anyOf'));
+  assert.equal(result.results[0].evidence[0].quote, source.messages[0].text);
+  assert.equal(result.configuration.generationConstraintVersion, 'all-criteria-source-span-copy-quotes-v4');
+});
+
+test('HTTP400 diagnostics expose only closed categories, never provider messages, secrets or response bodies', () => {
+  const cases: Array<[string, string, string]> = [
+    ['INVALID_ARGUMENT', 'The schema produces a constraint with too many states or too much branching. private-secret https://example.test/?sig=private', 'schema_complexity'],
+    ['INVALID_ARGUMENT', 'A schema in GenerationConfig exceeds the maximum allowed nesting depth. private-secret', 'schema_complexity'],
+    ['INVALID_ARGUMENT', 'response_json_schema contains an unsupported field. private-secret', 'schema_unsupported'],
+    ['INVALID_ARGUMENT', 'Request contains an invalid argument. private-secret', 'invalid_argument_unspecified'],
+    ['FAILED_PRECONDITION', 'A prerequisite is not met. private-secret', 'bad_request_unspecified'],
+  ];
+  for (const [status, message, expected] of cases) {
+    const failure = safeProviderFailure({ status: 400, name: 'ApiError', message: JSON.stringify({ error: { code: 400, status, message } }), requestUrl: 'https://example.test/?key=private-secret' });
+    assert.equal(failure.requestRejection, expected); assert(!JSON.stringify(failure).includes('private-secret')); assert(!JSON.stringify(failure).includes('https://'));
+  }
+  assert.equal(safeProviderFailure({ status: 400, message: 'unclassified private-secret' }).requestRejection, 'bad_request_unspecified');
+  assert.equal('requestRejection' in safeProviderFailure({ status: 403, message: 'response_json_schema unsupported private-secret' }), false);
+});
+
+test('a schema-related HTTP400 is terminal after one transport call with sanitized observable diagnostics', async () => {
+  let calls = 0; let caught: unknown; const observed: ProviderTelemetry[] = [];
+  try { await new GeminiProvider({ ...config, retryLimit: 1 }, { ...transport, generate: async () => { calls++; throw { status: 400, name: 'ApiError', message: JSON.stringify({ error: { status: 'INVALID_ARGUMENT', message: 'response_json_schema has unsupported anyOf constraint. private-source-and-secret' } }) }; } }, event => observed.push(event)).evaluate(conversation, checklist); }
+  catch (error) { caught = error; }
+  assert.equal(calls, 1); const trace = getProviderTelemetry(caught)!;
+  assert.equal(trace.retryCount, 0); assert.equal(trace.attempts[0].failure?.requestRejection, 'schema_unsupported'); assert.equal(trace.attempts[0].stopReason, 'non_retryable');
+  assert(!JSON.stringify(observed).includes('private-source-and-secret')); assert.equal((caught as { code: string }).code, 'PROVIDER_FAILED');
 });

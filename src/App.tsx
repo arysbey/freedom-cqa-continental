@@ -8,11 +8,12 @@ import { AudioPlayer } from './AudioPlayer.js';
 import { QualityPanel } from './QualityPanel.js';
 import { DataPermissionPanel } from './DataPermissionPanel.js';
 import { AttemptStatus } from './AttemptStatus.js';
+import { SubmissionPanel } from './SubmissionPanel.js';
 import type { AttemptView } from './AttemptStatus.js';
 
 type Summary = Pick<Conversation, 'version' | 'conversationId' | 'groupId' | 'language' | 'channel' | 'classification'> & { messageCount: number; audioAvailable: boolean };
 type Status = { model: string; apiKeyPresent: boolean; freeTierConfirmed: boolean; liveEvaluationCount: number; manualEvaluationCount?: number };
-type Tab = 'review' | 'checklist' | 'quality';
+type Tab = 'review' | 'checklist' | 'quality' | 'submission';
 type Filters = { search: string; language: string; channel: string; group: string; status: string; sort: string };
 const defaultFilters: Filters = { search: '', language: '', channel: '', group: 'DEV', status: '', sort: 'id' };
 const speakers = { client: 'Клиент', operator: 'Оператор', bot: 'Бот', system: 'Система' };
@@ -67,7 +68,7 @@ export function App() {
   const [group, setGroup] = useState('DEV');
   const [tab, setTab] = useState<Tab>(() => {
     const view = new URLSearchParams(location.search).get('view');
-    return view === 'quality' || view === 'checklist' ? view : 'review';
+    return view === 'quality' || view === 'checklist' || view === 'submission' ? view : 'review';
   });
   const selectedRef = useRef(selectedVersion);
   const conversationButtons = useRef(new Map<string, HTMLButtonElement>());
@@ -237,6 +238,7 @@ export function App() {
         <button aria-pressed={tab === 'review'} onClick={() => setTab('review')}>Оценка диалогов</button>
         <button aria-pressed={tab === 'checklist'} onClick={() => setTab('checklist')}>Чек-листы</button>
         <button aria-pressed={tab === 'quality'} onClick={() => setTab('quality')}>Проверка качества</button>
+        <button aria-pressed={tab === 'submission'} onClick={() => setTab('submission')}>Сдача результатов</button>
       </nav>
       <span className="badge storage-badge"><span className="status-dot" />Локальное хранение</span>
     </header>
@@ -245,6 +247,7 @@ export function App() {
     {initialLoading ? <main className="loading-screen" aria-busy="true"><span className="loading-indicator" /><h1>Открываем рабочий набор</h1><p>Загружаются локальные диалоги, чек-листы и сохранённые оценки.</p></main>
       : tab === 'checklist' ? <ChecklistEditor checklists={checklists} selectedVersion={checklistVersion} onSaved={saved => { setChecklistVersion(saved.version); void reload().catch(e => setError(String(e.message))); }} onError={setError}/>
         : tab === 'quality' ? <QualityPanel onError={setError}/>
+          : tab === 'submission' ? <SubmissionPanel/>
           : <main className="workspace">
             <aside className="sidebar" aria-label="Диалоги и фильтры">
               <div className="sidebar-heading"><p className="eyebrow">Рабочий набор</p><h1>DEV <span>{devCount}</span></h1><p className="dataset-separation">Официальный набор · {devCount} записей{otherCount > 0 && <><br/><button onClick={() => setFilters({ ...defaultFilters, group: '' })}>Другие группы: {otherCount}</button></>}</p></div>

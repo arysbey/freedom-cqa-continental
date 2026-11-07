@@ -10,6 +10,7 @@ import { PermissionStore } from './data-permissions.js';
 import { recoveryPolicy } from './recovery.js';
 
 let inFlight = false;
+const executorSessionId = randomUUID();
 export async function evaluateAndSave(store: Store, conversationVersion: string, checklistVersion: string, options: { attemptId?: string; retryOf?: string; permissions?: PermissionStore } = {}): Promise<Evaluation> {
   const id = options.attemptId || randomUUID();
   const existing = store.getEvaluationAttempt(id);
@@ -44,7 +45,7 @@ export async function evaluateAndSave(store: Store, conversationVersion: string,
   }
   inFlight = true;
   const started = Date.now();
-  let attempt: EvaluationAttempt = { id, requestId: id, ...(options.retryOf ? { recoveryOf: options.retryOf } : {}), recoveryDepth, conversationVersion, checklistVersion, model: config.model, startedAt: new Date(started).toISOString(), finishedAt: null, status: 'running', evaluationId: null, errorCode: null, latencyMs: null, usage: null };
+  let attempt: EvaluationAttempt = { id, requestId: id, ...(options.retryOf ? { recoveryOf: options.retryOf } : {}), recoveryDepth, executorPid: process.pid, executorSessionId, conversationVersion, checklistVersion, model: config.model, startedAt: new Date(started).toISOString(), finishedAt: null, status: 'running', evaluationId: null, errorCode: null, latencyMs: null, usage: null };
   let registered = false;
   try {
     store.startEvaluationAttempt(attempt); registered = true;

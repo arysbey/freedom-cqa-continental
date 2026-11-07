@@ -42,6 +42,12 @@ export interface ProviderCallAttempt {
 export interface ProviderTelemetry {
   recoveryVersion: 'bounded-recovery-v1';
   configurationFingerprint: string;
+  generationConstraintVersion?: 'all-criteria-source-span-v1' | 'all-criteria-source-span-exact-quotes-v2' | 'all-criteria-source-span-flat-quotes-v3' | 'all-criteria-source-span-copy-quotes-v4';
+  compatiblePreviousFingerprint?: string;
+  compatibleSourceSpanFingerprint?: string;
+  compatibleExactQuotesFingerprint?: string;
+  compatibleFlatQuotesFingerprint?: string;
+  generationCompatibilityScope?: 'configuration-transition-only-not-vendor-acceptance';
   promptVersion: 'evidence-first-v2';
   schemaVersion: 'criterion-evidence-v1';
   providerCallCount: number;
@@ -72,6 +78,17 @@ function safeCode(value: unknown): string | number | null {
   return typeof value === 'string' && safeErrorCodes.has(value) ? value : null;
 }
 function safeName(value: unknown): string | null { return typeof value === 'string' && safeErrorNames.has(value) ? value : null; }
+/** Closed categories only: provider text is inspected transiently, never returned or retained. */
+function classifyBadRequest(object: Record<string, unknown>): 'schema_complexity' | 'schema_unsupported' | 'invalid_argument_unspecified' | 'bad_request_unspecified' {
+  let detail = objectValue(object.error);
+  const sdkMessage = typeof object.message === 'string' && object.message.length <= 65536 ? object.message : '';
+  if (sdkMessage.startsWith('{')) { try { detail = objectValue(objectValue(JSON.parse(sdkMessage)).error); } catch { /* An unstructured SDK error is still classified without exposing it. */ } }
+  const message = typeof detail.message === 'string' && detail.message.length <= 65536 ? detail.message : sdkMessage;
+  const schemaContext = /schema|generation.?config/i.test(message);
+  if (schemaContext && /too many states|too much branching|maximum allowed nesting depth|schema.{0,100}(?:too complex|too large|complexity|exceeds)|constraint.{0,100}(?:states|branching)/i.test(message)) return 'schema_complexity';
+  if (schemaContext && /unsupported|not supported|unknown (?:field|name)|not allowed|only allowed/i.test(message)) return 'schema_unsupported';
+  return detail.status === 'INVALID_ARGUMENT' || object.code === 'INVALID_ARGUMENT' ? 'invalid_argument_unspecified' : 'bad_request_unspecified';
+}
 /** No error messages, provider response bodies, request URLs or header values ever enter diagnostics. */
 export function safeProviderFailure(error: unknown) {
   const object = objectValue(error);
@@ -82,6 +99,7 @@ export function safeProviderFailure(error: unknown) {
     httpStatus: status !== null && Number.isInteger(status) && status >= 100 && status <= 599 ? status : null,
     errorName: safeName(object.name), errorCode: safeCode(object.code),
     causeName: safeName(cause.name), causeCode: safeCode(cause.code),
+    ...(status === 400 ? { requestRejection: classifyBadRequest(object) } : {}),
   };
 }
 function safeUsage(usage: GenerationResponse['usageMetadata']) {
@@ -102,7 +120,12 @@ First locate source evidence, then decide each answer. Give exact nonempty sourc
 /** Recovery settings deliberately do not change the semantic configuration identity. */
 export function getProviderConfigurationIdentity(config: ProviderConfig) {
   const semantic = { provider: config.provider, model: config.model, mode: config.mode, api: 'generateContent', thinkingLevel: config.model.startsWith('gemini-3.') ? 'LOW' : 'provider-default', maxOutputTokens: 10000, promptVersion: 'evidence-first-v2' as const, schemaVersion: 'criterion-evidence-v1' as const, minimizationVersion: 'source-redaction-v1', systemInstruction: SYSTEM_INSTRUCTION };
-  return { configurationFingerprint: createHash('sha256').update(JSON.stringify(semantic)).digest('hex'), promptVersion: semantic.promptVersion, schemaVersion: semantic.schemaVersion, recoveryVersion: 'bounded-recovery-v1' as const };
+  const compatiblePreviousFingerprint = createHash('sha256').update(JSON.stringify(semantic)).digest('hex');
+  const compatibleSourceSpanFingerprint = createHash('sha256').update(JSON.stringify({ ...semantic, generationConstraintVersion: 'all-criteria-source-span-v1' })).digest('hex');
+  const compatibleExactQuotesFingerprint = createHash('sha256').update(JSON.stringify({ ...semantic, generationConstraintVersion: 'all-criteria-source-span-exact-quotes-v2' })).digest('hex');
+  const compatibleFlatQuotesFingerprint = createHash('sha256').update(JSON.stringify({ ...semantic, generationConstraintVersion: 'all-criteria-source-span-flat-quotes-v3' })).digest('hex');
+  const generationConstraintVersion = 'all-criteria-source-span-copy-quotes-v4' as const;
+  return { configurationFingerprint: createHash('sha256').update(JSON.stringify({ ...semantic, generationConstraintVersion })).digest('hex'), compatiblePreviousFingerprint, compatibleSourceSpanFingerprint, compatibleExactQuotesFingerprint, compatibleFlatQuotesFingerprint, generationConstraintVersion, generationCompatibilityScope: 'configuration-transition-only-not-vendor-acceptance' as const, promptVersion: semantic.promptVersion, schemaVersion: semantic.schemaVersion, recoveryVersion: 'bounded-recovery-v1' as const };
 }
 const transientNetworkCodes = new Set(['ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET']);
 const RETRY_DELAY_MS = 500;
@@ -242,7 +265,7 @@ export class GeminiProvider {
         try {
           const timedOut = new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new ProviderError('PROVIDER_TIMEOUT', 'The Gemini request exceeded the total time budget; no score was saved.')); }, remainingMs); });
           providerCallCount++; diagnosticAttempts.push(call);
-          const generation = transport.generate({ model: this.config.model, contents: payload, systemInstruction: SYSTEM_INSTRUCTION, schema: evaluationJsonSchema(checklist, minimized.conversation.messages.map(message => message.id)), signal: controller.signal, timeoutMs: remainingMs });
+          const generation = transport.generate({ model: this.config.model, contents: payload, systemInstruction: SYSTEM_INSTRUCTION, schema: evaluationJsonSchema(checklist, minimized.conversation.messages.map(message => message.id), { requireCheckedRange: true }), signal: controller.signal, timeoutMs: remainingMs });
           recordDiagnostic({ status: 'request-started', providerCallCount }); observe('running');
           response = await Promise.race([generation, timedOut]);
           Object.assign(call, { status: 'response-received', elapsedMs: elapsed(), reportedUsage: safeUsage(response.usageMetadata) });

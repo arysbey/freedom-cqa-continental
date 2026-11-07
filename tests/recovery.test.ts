@@ -9,7 +9,7 @@ import { ReviewStore } from '../server/reviews.js';
 import { isApprovedSyntheticConversation, parseOrganizerResponse } from '../server/importer.js';
 import { GeminiProvider, getProviderConfigurationIdentity, type ProviderTelemetry, type ProviderTransport } from '../server/provider.js';
 import { publicAttempt, recoveryPolicy } from '../server/recovery.js';
-import { interruptRecordedAttempts } from '../server/interrupted-attempts.js';
+import { interruptRecordedAttempts, probeExecutorPid } from '../server/interrupted-attempts.js';
 import { initialChecklist } from '../src/checklist.js';
 import { calculateScore } from '../src/scoring.js';
 import type { Checklist, Conversation, CriterionResult, Evaluation, EvaluationAttempt } from '../src/domain.js';
@@ -163,6 +163,9 @@ test('running status is observable and duplicate/concurrent submissions do not c
     await entered;
     const running = await context.app.inject({ url: `/api/evaluation-attempts/${payload.requestId}`, headers });
     assert.equal(running.statusCode, 200); assert.equal(running.json().status, 'running'); assert.equal(running.json().providerCallCount, 1);
+    assert.equal(running.json().executorPid, process.pid); assert.match(running.json().executorSessionId, /^[0-9a-f-]{36}$/);
+    assert.equal(interruptRecordedAttempts(context.store, [payload.requestId]), 0);
+    assert.equal(context.store.getEvaluationAttempt(payload.requestId)?.status, 'running');
     assert.equal(running.json().events[0].status, 'running'); assert.equal(running.json().telemetry.outcome, 'running'); assert.equal(running.json().recovery.canRetry, false);
     for (const pendingBody of [payload, body(context.conversation, 'observable-other-001')]) {
       const busy = await context.app.inject({ method: 'POST', url: '/api/evaluations', headers, payload: pendingBody });
@@ -240,7 +243,7 @@ test('attempt identity and terminal history cannot be mutated by progress update
   const local = tempStore();
   try {
     const attempt = pendingAttempt(local.conversation, 'immutable-attempt-001'); local.store.startEvaluationAttempt(attempt);
-    for (const change of [{ conversationVersion: 'changed' }, { checklistVersion: 'changed' }, { model: 'changed' }, { requestId: 'changed' }, { startedAt: 'changed' }, { recoveryOf: 'changed' }, { recoveryDepth: 1 }]) {
+    for (const change of [{ conversationVersion: 'changed' }, { checklistVersion: 'changed' }, { model: 'changed' }, { requestId: 'changed' }, { startedAt: 'changed' }, { recoveryOf: 'changed' }, { recoveryDepth: 1 }, { executorPid: process.pid }, { executorSessionId: 'changed' }]) {
       assert.throws(() => local.store.updateRunningEvaluationAttempt({ ...attempt, ...change }), /IMMUTABLE_ATTEMPT_SOURCE/);
       assert.throws(() => local.store.finishEvaluationAttempt({ ...attempt, ...change, status: 'failed' }), /IMMUTABLE_ATTEMPT_SOURCE/);
     }
@@ -318,4 +321,47 @@ test('interrupted requests remain idempotent and allow exactly one explicit reco
     assert.equal(second.statusCode, 409); assert.equal(second.json().error, 'RECOVERY_ALREADY_STARTED'); assert.equal(calls, 1);
     assert.equal(context.store.listEvaluationAttempts().length, 2); assert.equal(context.store.listEvaluations().length, 1);
   } finally { await context.close(); }
+});
+
+test('owner existence probe treats only ESRCH as dead and never sends an actual signal', t => {
+  const probed: number[] = [];
+  t.mock.method(process, 'kill', (pid: number, signal?: number | string) => {
+    assert.equal(signal, 0); probed.push(pid);
+    if (pid === 101) throw Object.assign(new Error('Process absent'), { code: 'ESRCH' });
+    if (pid === 102) throw Object.assign(new Error('Permissions unavailable'), { code: 'EPERM' });
+    if (pid === 103) throw Object.assign(new Error('Access unavailable'), { code: 'EACCES' });
+    if (pid === 104) throw new Error('Unexpected probe failure');
+    return true as const;
+  });
+  assert.equal(probeExecutorPid(101), 'dead'); assert.equal(probeExecutorPid(102), 'unknown'); assert.equal(probeExecutorPid(103), 'unknown'); assert.equal(probeExecutorPid(104), 'unknown'); assert.equal(probeExecutorPid(105), 'alive');
+  for (const invalid of [0, -1, NaN, Infinity, 1.5, 2147483648]) assert.equal(probeExecutorPid(invalid), 'unknown');
+  assert.deepEqual(probed, [101, 102, 103, 104, 105]);
+});
+
+test('restart preserves live/uncertain executor ownership and interrupts only a confirmed dead owner', () => {
+  const local = tempStore();
+  try {
+    const dead = pendingAttempt(local.conversation, 'dead-owner-request-001', { executorPid: 101, executorSessionId: 'dead-session', usage: { totalTokens: 130 } });
+    const alive = pendingAttempt(local.conversation, 'alive-owner-request-001', { executorPid: 105, executorSessionId: 'alive-session' });
+    const uncertain = pendingAttempt(local.conversation, 'uncertain-owner-request-001', { executorPid: 102, executorSessionId: 'uncertain-session' });
+    for (const request of [dead, alive, uncertain]) local.store.startEvaluationAttempt(request);
+    const finishedAt = '2026-11-07T12:00:00.000Z';
+    const probe = (pid: number) => pid === dead.executorPid ? 'dead' as const : pid === alive.executorPid ? 'alive' as const : 'unknown' as const;
+    assert.equal(interruptRecordedAttempts(local.store, [dead.id, alive.id, uncertain.id], finishedAt, probe), 1);
+    assert.deepEqual(local.store.getEvaluationAttempt(alive.id), alive); assert.deepEqual(local.store.getEvaluationAttempt(uncertain.id), uncertain);
+    assert.deepEqual(local.store.getEvaluationAttempt(dead.id), { ...dead, status: 'failed', finishedAt, evaluationId: null, errorCode: 'REQUEST_INTERRUPTED', usage: null });
+    assert.equal(local.store.listEvaluations().length, 0);
+  } finally { local.store.close(); removeLocalTemp(local.dir); }
+});
+
+test('executor PID/session cannot be changed, removed or added through progress and finish updates', () => {
+  const local = tempStore();
+  try {
+    const owned = pendingAttempt(local.conversation, 'immutable-owned-request-001', { executorPid: process.pid, executorSessionId: 'immutable-session' }); local.store.startEvaluationAttempt(owned);
+    for (const change of [{ executorPid: process.pid + 1 }, { executorSessionId: 'different-session' }, { executorPid: undefined }, { executorSessionId: undefined }]) {
+      assert.throws(() => local.store.updateRunningEvaluationAttempt({ ...owned, ...change }), /IMMUTABLE_ATTEMPT_SOURCE/);
+      assert.throws(() => local.store.finishEvaluationAttempt({ ...owned, ...change, status: 'failed' }), /IMMUTABLE_ATTEMPT_SOURCE/);
+    }
+    assert.deepEqual(local.store.getEvaluationAttempt(owned.id), owned);
+  } finally { local.store.close(); removeLocalTemp(local.dir); }
 });

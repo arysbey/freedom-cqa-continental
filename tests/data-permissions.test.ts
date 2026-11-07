@@ -68,3 +68,115 @@ test('approval and request history survive restart and SQL mutation is blocked',
     const direct = new DatabaseSync(dbPath); assert.throws(() => direct.exec('DELETE FROM permission_approvals'), /append-only/); assert.throws(() => direct.exec("UPDATE permission_requests SET payload='changed'"), /append-only/); direct.close(); secondStore.close();
   } finally { const target = resolve(directory); assert(target.startsWith(resolve('tmp') + '\\') || target.startsWith(resolve('tmp') + '/')); rmSync(target, { recursive: true }); }
 });
+
+function batchSources() {
+  return [source, { ...structuredClone(source), version: 'new-group-fixture-v2', conversationId: 'synthetic-fixture-two', messages: source.messages.map((message, index) => ({ ...message, id: `second:${index}` })) }];
+}
+function batchInput(store: PermissionStore, sources = batchSources(), requestId = 'batch-fixture-request') {
+  const { eligibleCount: _eligibleCount, ...binding } = store.previewBatch(sources); void _eligibleCount;
+  return { ...binding, ...input, requestId };
+}
+
+test('batch preview is deterministic, source bound and never grants permission', () => {
+  const store = new PermissionStore(':memory:');
+  try {
+    const sources = batchSources(), original = structuredClone(sources);
+    const preview = store.previewBatch(sources);
+    assert.deepEqual(store.previewBatch([...sources].reverse()), preview);
+    assert.equal(preview.groupId, source.groupId); assert.equal(preview.eligibleCount, 2);
+    assert.deepEqual(preview.conversationVersions, sources.map(item => item.version));
+    assert.match(preview.sourceFingerprint, /^[a-f0-9]{64}$/);
+    assert.notEqual(store.previewBatch([{ ...sources[0], language: 'KZ' }, sources[1]]).sourceFingerprint, preview.sourceFingerprint);
+    assert(!JSON.stringify(preview).includes(source.messages[0].text));
+    assert.deepEqual(sources, original); for (const item of sources) assert.equal(store.resolve(item), item);
+  } finally { store.close(); }
+});
+
+test('batch approval binds all versions atomically and exact replay is idempotent', () => {
+  const store = new PermissionStore(':memory:');
+  try {
+    const sources = batchSources(), original = structuredClone(sources), request = batchInput(store, sources);
+    const approved = store.approveBatch(sources, request);
+    assert.equal(approved.scope, 'one-immutable-synthetic-chat-batch'); assert.equal(approved.eligibleCount, 2);
+    assert.equal(new Set(approved.approvalIds).size, 2);
+    assert.deepEqual(store.approveBatch([...sources].reverse(), request), approved);
+    for (const [index, item] of sources.entries()) {
+      const saved = store.getPermission(item.version)!;
+      assert.equal(saved.id, approved.approvalIds[index]); assert.match(saved.requestId, /^batch_permission_[a-f0-9]{64}_\d+$/);
+      assert.equal(saved.sourceFingerprint, conversationFingerprint(item)); assert.equal(saved.reviewer, input.reviewer);
+      assert.equal(store.resolve(item).classification, 'synthetic_allowed');
+    }
+    assert.deepEqual(sources, original);
+    for (const patch of [{ reason: 'changed purpose' }, { reviewer: 'different software fixture' }]) assert.throws(() => store.approveBatch(sources, { ...request, ...patch }), /IDEMPOTENCY_CONFLICT/);
+    const otherGroup = sources.map(item => ({ ...item, groupId: 'OTHER_LOCAL_FIXTURE' }));
+    assert.throws(() => store.approveBatch(otherGroup, batchInput(store, otherGroup, request.requestId)), /IDEMPOTENCY_CONFLICT/);
+  } finally { store.close(); }
+});
+
+test('any restricted, duplicate or mixed-group member rejects the whole batch before a grant', () => {
+  const store = new PermissionStore(':memory:');
+  try {
+    const sources = batchSources(); const request = batchInput(store, sources);
+    const invalid = [[], [source, source], [source, { ...sources[1], conversationId: source.conversationId }], [source, { ...sources[1], groupId: 'OTHER' }],
+      [source, { ...sources[1], channel: 'voice call' }], [source, { ...sources[1], audioAvailable: true }],
+      [source, { ...sources[1], classification: 'real_restricted' as const }], [source, { ...sources[1], classification: 'synthetic_allowed' as const }]];
+    for (const list of invalid) {
+      assert.throws(() => store.previewBatch(list), /DATA_PERMISSION/);
+      assert.throws(() => store.approveBatch(list, request), /DATA_PERMISSION/);
+      for (const item of sources) assert.equal(store.getPermission(item.version), undefined);
+    }
+  } finally { store.close(); }
+});
+
+test('stale source sets, source contents or preview bindings never grant batch permission', () => {
+  const store = new PermissionStore(':memory:');
+  try {
+    const sources = batchSources(); const request = batchInput(store, sources);
+    for (const patch of [{ groupId: 'OTHER' }, { conversationVersions: [source.version] }, { conversationVersions: [...request.conversationVersions, 'extra-version'] }, { conversationVersions: [...request.conversationVersions].reverse() }, { sourceFingerprint: '0'.repeat(64) }]) {
+      assert.throws(() => store.approveBatch(sources, { ...request, ...patch }), /BATCH_SOURCE_MISMATCH/);
+    }
+    const changed = [sources[0], { ...sources[1], messages: [...sources[1].messages].reverse() }];
+    assert.throws(() => store.approveBatch(changed, request), /BATCH_SOURCE_MISMATCH/);
+    for (const patch of [{ syntheticAttestation: false }, { freeTierUseApproved: false }, { origin: 'agent_demo' }, { reviewer: ' ' }, { reason: '' }, { extraField: 'must reject' }]) assert.throws(() => store.approveBatch(sources, { ...request, ...patch }));
+    for (const item of sources) assert.equal(store.getPermission(item.version), undefined);
+  } finally { store.close(); }
+});
+
+test('an existing conflicting per-source binding is detected before any batch insert', () => {
+  const store = new PermissionStore(':memory:');
+  try {
+    const sources = batchSources(); const previous = store.approve(sources[1], input);
+    const changed = [sources[0], { ...sources[1], messages: sources[1].messages.map((message, index) => index ? message : { ...message, text: 'A changed but still purely fabricated source.' }) }];
+    assert.throws(() => store.approveBatch(changed, batchInput(store, changed)), /IMMUTABLE_PERMISSION_SOURCE/);
+    assert.equal(store.getPermission(sources[0].version), undefined); assert.deepEqual(store.getPermission(sources[1].version), previous);
+  } finally { store.close(); }
+});
+
+test('a mid-batch SQLite failure rolls back every child approval and request', () => {
+  mkdirSync(resolve('tmp'), { recursive: true }); const directory = mkdtempSync(join(resolve('tmp'), 'batch-permission-rollback-')); const path = join(directory, 'isolated.sqlite');
+  const store = new PermissionStore(path); const direct = new DatabaseSync(path);
+  try {
+    const sources = batchSources(); const request = batchInput(store, sources);
+    direct.exec("CREATE TRIGGER fixture_insert_failure BEFORE INSERT ON permission_approvals WHEN NEW.conversation_version='new-group-fixture-v2' BEGIN SELECT RAISE(ABORT,'INJECTED_SOFTWARE_STORAGE_FAILURE'); END;");
+    assert.throws(() => store.approveBatch(sources, request), /INJECTED_SOFTWARE_STORAGE_FAILURE/);
+    assert.equal(direct.prepare('SELECT COUNT(*) AS count FROM permission_approvals').get()?.count, 0);
+    assert.equal(direct.prepare('SELECT COUNT(*) AS count FROM permission_requests').get()?.count, 0);
+    for (const item of sources) assert.equal(store.resolve(item), item);
+  } finally { direct.close(); store.close(); const target = resolve(directory); assert(target.startsWith(resolve('tmp') + '\\') || target.startsWith(resolve('tmp') + '/')); rmSync(target, { recursive: true }); }
+});
+
+test('batch grant audit and replay survive restart without duplicate child rows', () => {
+  mkdirSync(resolve('tmp'), { recursive: true }); const directory = mkdtempSync(join(resolve('tmp'), 'batch-permission-restart-')); const path = join(directory, 'isolated.sqlite');
+  try {
+    const sources = batchSources(); const firstStore = new PermissionStore(path); const request = batchInput(firstStore, sources);
+    const first = firstStore.approveBatch(sources, request); firstStore.close();
+    const secondStore = new PermissionStore(path);
+    try {
+      assert.deepEqual(secondStore.approveBatch(sources, request), first);
+      for (const item of sources) assert.equal(secondStore.resolve(item).classification, 'synthetic_allowed');
+      const direct = new DatabaseSync(path, { readOnly: true });
+      try { assert.equal(direct.prepare('SELECT COUNT(*) AS count FROM permission_approvals').get()?.count, 2); assert.equal(direct.prepare('SELECT COUNT(*) AS count FROM permission_requests').get()?.count, 3); }
+      finally { direct.close(); }
+    } finally { secondStore.close(); }
+  } finally { const target = resolve(directory); assert(target.startsWith(resolve('tmp') + '\\') || target.startsWith(resolve('tmp') + '/')); rmSync(target, { recursive: true }); }
+});
