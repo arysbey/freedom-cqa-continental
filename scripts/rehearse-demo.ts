@@ -2,18 +2,21 @@
 import { chromium, expect } from '@playwright/test';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
+import { createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import assert from 'node:assert/strict';
 import type { Checklist, Conversation, Evaluation, EvaluationAttempt } from '../src/domain.js';
 import type { ReviewHistory } from '../server/reviews.js';
 import type { ValidationManifest } from '../server/quality.js';
 import { config } from '../server/config.js';
 
-interface QualityView { manifest: ValidationManifest | null; referenceCount: number; metrics: { comparedCases: number; resolvedHumanJudgments: number; totalScoreError: { dialogs: number; meanAbsoluteError: number | null }; reliability: { attempts: number; successes: number; failures: number; errors: Record<string, number> } } | null }
+interface QualityView { manifest: ValidationManifest | null; reviewRound?: { id: string }; referenceCount: number; metrics: { comparedCases: number; resolvedHumanJudgments: number; totalScoreError: { dialogs: number; meanAbsoluteError: number | null }; reliability: { attempts: number; successes: number; failures: number; errors: Record<string, number> } } | null }
 interface Checkpoint { targetSeconds: number; actualSeconds: number; finishedSeconds: number; name: string; status: 'PASS' | 'FAIL' | 'BLOCKED'; findings?: unknown; failure?: string }
 const base = `http://127.0.0.1:${config.port}`;
 const chrome = 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const currentModel = process.argv.includes('--current-model');
-const directory = currentModel ? 'private/reports/demo-rehearsal-current-model' : 'private/reports/demo-rehearsal';
+const runId = new Date().toISOString().replaceAll(':', '_').replaceAll('.', '_');
+const directory = currentModel ? `private/reports/demo-rehearsal-current-model/${runId}` : `private/reports/demo-rehearsal/${runId}`;
 mkdirSync(directory, { recursive: true });
 const browser = await chromium.launch({ executablePath: process.env.CQA_BROWSER_EXECUTABLE || (existsSync(chrome) ? chrome : undefined), headless: true, args: ['--autoplay-policy=no-user-gesture-required'] });
 const context = await browser.newContext({ viewport: { width: 1540, height: 1000 }, reducedMotion: 'reduce' });
@@ -26,11 +29,13 @@ page.on('pageerror', error => browserErrors.push(error.message));
 await context.route('**/*', async route => {
   const request = route.request();
   const url = new URL(request.url());
-  if (['http:', 'https:'].includes(url.protocol) && url.origin !== base) externalBrowserRequests++;
-  if (url.origin === base && !['GET', 'HEAD'].includes(request.method())) {
+  const external = ['http:', 'https:'].includes(url.protocol) && url.origin !== base;
+  if (external) externalBrowserRequests++;
+  if (!['GET', 'HEAD'].includes(request.method())) {
     blockedMutations.push({ method: request.method(), path: url.pathname });
     await route.abort('blockedbyclient');
-  } else await route.continue();
+  } else if (external) await route.abort('blockedbyclient');
+  else await route.continue();
 });
 async function json<T>(path: string): Promise<T> {
   const response = await context.request.get(`${base}${path}`);
@@ -39,6 +44,18 @@ async function json<T>(path: string): Promise<T> {
 }
 const checkpoints: Checkpoint[] = [];
 const screenshots: string[] = [];
+let heartbeat: ReturnType<typeof setInterval> | undefined;
+/** Hash existing human history without exposing or writing any answer. New human work may append rows. */
+function humanHistory() {
+  const db = new DatabaseSync(config.dbPath, { readOnly: true });
+  try {
+    db.exec('PRAGMA query_only=ON; BEGIN');
+    const rows = ['quality_references', 'quality_evidence_reviews', 'quality_review_rounds'].flatMap(table =>
+      (db.prepare(`SELECT id,json FROM ${table} ORDER BY rowid`).all() as Array<{ id: string; json: string }>).map(row => ({ table, id: row.id, hash: createHash('sha256').update(row.json).digest('hex') })));
+    db.exec('COMMIT');
+    return rows;
+  } finally { db.close(); }
+}
 let started = 0;
 const elapsed = () => (performance.now() - started) / 1000;
 async function until(seconds: number) {
@@ -71,21 +88,28 @@ async function openConversation(conversation: Pick<Conversation, 'version' | 'co
 }
 async function selectSaved(evaluation: Evaluation) {
   await page.getByRole('combobox', { name: 'Сохранённая оценка', exact: true }).selectOption(evaluation.id);
+  await expect(page.getByRole('combobox', { name: 'Сохранённая оценка', exact: true })).toHaveValue(evaluation.id);
   await expect(page.locator('.result-version')).toContainText(evaluation.checklistVersion);
   await expect(page.locator('.evaluation-provenance')).toContainText('сохранённый ответ предыдущего реального запроса');
+  await expect(page.locator('.evaluation-provenance')).toContainText(evaluation.model);
 }
 
 try {
+  const humanHistoryBefore = humanHistory();
   const [conversations, evaluationsBefore, attemptsBefore, checklists, qualityBefore] = await Promise.all([
     json<Conversation[]>('/api/conversations'), json<Evaluation[]>('/api/evaluations'), json<EvaluationAttempt[]>('/api/evaluation-attempts'), json<Checklist[]>('/api/checklists'), json<QualityView>('/api/quality'),
   ]);
   const synthetic = conversations.find(c => c.groupId === 'DEV' && c.conversationId === 'p1-ru-001');
-  const official = evaluationsBefore.find(e => e.conversationVersion === synthetic?.version && e.checklistVersion === 'official-v1' && e.status === 'live_validated');
+  const official = evaluationsBefore.find(e => e.conversationVersion === synthetic?.version && e.checklistVersion === 'official-v1' && e.status === 'live_validated' && (!currentModel || e.model === config.model));
   const urlResult = evaluationsBefore.find(e => e.id === 'fcf30c1f-cf45-4314-ac24-00831c66fc0f');
   const navigationResult = evaluationsBefore.find(e => e.id === '4c7739b2-b724-40fa-8bb7-09c8499d957c');
   const call = conversations.find(c => c.groupId === 'DEV' && c.conversationId === 'p4-ru-001');
   assert(synthetic && official && urlResult && navigationResult && call, 'MISSING_SAVED_DEMO_SOURCE');
-  if (currentModel) assert.equal(official.model, config.model, 'CURRENT_MODEL_SAVED_RESULT_REQUIRED');
+  if (currentModel) for (const result of [official, urlResult, navigationResult]) {
+    assert.equal(result.model, config.model, 'CURRENT_MODEL_SAVED_RESULT_REQUIRED');
+    assert.equal(result.provider, 'gemini', 'SAVED_GEMINI_PROVIDER_REQUIRED'); assert.equal(result.mode, 'free', 'SAVED_FREE_MODE_REQUIRED');
+    assert(result.origin === 'ai' || result.origin === undefined, 'AI_OR_LEGACY_AI_PROVENANCE_REQUIRED'); assert.equal(result.status, 'live_validated', 'SAVED_VALIDATED_RESULT_REQUIRED');
+  }
   const historyBefore = await json<ReviewHistory>(`/api/evaluations/${urlResult.id}/history`);
   const sourceUrl = checklists.find(c => c.version === urlResult.checklistVersion);
   const sourceNavigation = checklists.find(c => c.version === navigationResult.checklistVersion);
@@ -93,12 +117,13 @@ try {
   const voice = await json<Conversation>(`/api/conversations/${call.version}`);
   started = performance.now();
   const wallStartedAt = new Date().toISOString();
-  const heartbeat = setInterval(() => console.log(JSON.stringify({ progress: 'rehearsal-running', elapsedSeconds: Number(elapsed().toFixed(1)) })), 30000);
+  heartbeat = setInterval(() => console.log(JSON.stringify({ progress: 'rehearsal-running', elapsedSeconds: Number(elapsed().toFixed(1)) })), 30000);
   await at(0, '0–30 · официальный DEV и происхождение результата', async () => {
     await page.goto(base, { waitUntil: 'networkidle' });
     assert.equal(await page.getByRole('combobox', { name: 'Фильтр по группе', exact: true }).inputValue(), 'DEV');
     assert.equal(await page.getByRole('combobox', { name: 'Чек-лист', exact: true }).inputValue(), 'official-v1');
     assert.equal(await page.locator('.conversation').count(), 65);
+    await selectSaved(official);
     await expect(page.locator('.result-version')).toContainText('Официальный чек-лист · official-v1');
     await expect(page.locator('.assessment > .panel-heading .badge')).toHaveText('Сохранённый результат API');
     await shot('01-official-dev-desktop');
@@ -156,7 +181,7 @@ try {
     await page.locator('.criterion-details').scrollIntoViewIfNeeded();
     assert.equal(urlResult.results.find(r => r.criterionId === 'C9')?.answer, 'NO'); assert.equal(urlResult.score.total, 80);
     await shot('06-saved-url-no');
-    return { evaluationId: urlResult.id, checklistVersion: sourceUrl.version, answer: 'NO', total: 80, originalSavedAt: urlResult.createdAt, newCall: false };
+    return { evaluationId: urlResult.id, checklistVersion: sourceUrl.version, model: urlResult.model, answer: 'NO', total: 80, originalSavedAt: urlResult.createdAt, newCall: false };
   });
   await at(222, '222–240 · ранее сохранённая новая семантика', async () => {
     await selectSaved(navigationResult);
@@ -177,9 +202,11 @@ try {
     return { manifestId: manifest.id, development: 6, holdout: 6, byLanguage: Object.fromEntries(['ru', 'kz', 'en'].map(language => [language, manifest.cases.filter(c => c.language.toLowerCase() === language).length])), referenceCount: dashboard.referenceCount, comparedCases: dashboard.metrics?.comparedCases, resolvedJudgments: dashboard.metrics?.resolvedHumanJudgments, mae: dashboard.metrics?.totalScoreError.meanAbsoluteError, reliability: dashboard.metrics?.reliability, humanAttestationsByRehearsal: 0 };
   });
   await at(265, '265–285 · сохранённая ошибка и граница повторов', async () => {
-    const failed = attemptsBefore.find(a => a.status === 'failed'); assert(failed, 'MISSING_SAVED_FAILED_ATTEMPT');
+    const failed = attemptsBefore.find(a => a.status === 'failed' && (!currentModel || a.model === config.model)); assert(failed, 'MISSING_SAVED_FAILED_ATTEMPT');
     const source = conversations.find(c => c.version === failed.conversationVersion); assert(source);
     await openConversation(source);
+    const savedForFailureSource = evaluationsBefore.find(e => e.conversationVersion === source.version && e.model === config.model && e.status === 'live_validated');
+    if (savedForFailureSource) await selectSaved(savedForFailureSource);
     await page.getByRole('combobox', { name: 'Чек-лист', exact: true }).selectOption(failed.checklistVersion);
     const selector = page.getByRole('combobox', { name: 'История запросов', exact: true });
     if (await selector.count()) await selector.selectOption(failed.id);
@@ -204,8 +231,16 @@ try {
   await until(300);
   const actualDurationSeconds = elapsed(); clearInterval(heartbeat);
   const [evaluationsAfter, attemptsAfter, qualityAfter] = await Promise.all([json<Evaluation[]>('/api/evaluations'), json<EvaluationAttempt[]>('/api/evaluation-attempts'), json<QualityView>('/api/quality')]);
-  const dataUnchanged = evaluationsBefore.map(e => e.id).sort().join() === evaluationsAfter.map(e => e.id).sort().join() && attemptsBefore.map(a => a.id).sort().join() === attemptsAfter.map(a => a.id).sort().join();
-  const report = { status: checkpoints.every(c => c.status === 'PASS') && dataUnchanged && !browserErrors.length && !blockedMutations.length && !externalBrowserRequests ? 'PASS' : 'FAIL', source: 'actual-running-production-app-no-network-mocks', wallStartedAt, wallFinishedAt: new Date().toISOString(), plannedSeconds: 300, actualDurationSeconds, checkpoints, screenshots, browserErrors, blockedMutations, externalBrowserRequests, dataUnchanged, beforeSavedEvaluations: evaluationsBefore.length, afterSavedEvaluations: evaluationsAfter.length, beforeAttempts: attemptsBefore.length, afterAttempts: attemptsAfter.length, beforeReferences: qualityBefore.referenceCount, afterReferences: qualityAfter.referenceCount, newModelCalls: 0, newHumanJudgments: 0, savedChecklistVersionsCreated: 0, liveStep: 'Skipped deliberately; all displayed AI results were previously saved actual API responses.' };
+  const [checklistsAfter, historyAfter] = await Promise.all([json<Checklist[]>('/api/checklists'), json<ReviewHistory>(`/api/evaluations/${urlResult.id}/history`)]);
+  const dataUnchanged = JSON.stringify(evaluationsBefore) === JSON.stringify(evaluationsAfter) && JSON.stringify(attemptsBefore) === JSON.stringify(attemptsAfter) && JSON.stringify(checklists) === JSON.stringify(checklistsAfter) && JSON.stringify(historyBefore) === JSON.stringify(historyAfter);
+  const humanHistoryAfter = humanHistory();
+  const existingHumanHistoryPreserved = humanHistoryBefore.every(old => humanHistoryAfter.some(row => row.table === old.table && row.id === old.id && row.hash === old.hash));
+  const validationSplitPreserved = JSON.stringify(qualityBefore.manifest) === JSON.stringify(qualityAfter.manifest);
+  const humanRoundPreserved = qualityBefore.reviewRound?.id === qualityAfter.reviewRound?.id;
+  const timingPassed = actualDurationSeconds >= 300 && actualDurationSeconds < 301;
+  const targets = [0, 30, 90, 150, 180, 205, 222, 240, 265, 285];
+  const checkpointTimingPassed = checkpoints.length === targets.length && checkpoints.every((c, index) => c.targetSeconds === targets[index] && c.actualSeconds >= c.targetSeconds && c.actualSeconds < c.targetSeconds + 1 && c.finishedSeconds >= c.actualSeconds && c.finishedSeconds <= 300);
+  const report = { status: checkpoints.every(c => c.status === 'PASS') && timingPassed && checkpointTimingPassed && dataUnchanged && existingHumanHistoryPreserved && humanRoundPreserved && validationSplitPreserved && !browserErrors.length && !blockedMutations.length && !externalBrowserRequests ? 'PASS' : 'FAIL', source: 'actual-running-production-app-no-network-mocks', runId, currentModelRequired: currentModel, savedModels: [...new Set([official, urlResult, navigationResult].map(e => e.model))], wallStartedAt, wallFinishedAt: new Date().toISOString(), plannedSeconds: 300, actualDurationSeconds, timingPassed, checkpointTimingPassed, checkpoints, screenshots, browserErrors, blockedMutations, externalBrowserRequests, dataUnchanged, existingHumanHistoryPreserved, humanRoundPreserved, validationSplitPreserved, humanHistoryRowsBefore: humanHistoryBefore.length, humanHistoryRowsAfter: humanHistoryAfter.length, concurrentHumanAppendsAllowed: true, isolatedBrowserContext: true, beforeSavedEvaluations: evaluationsBefore.length, afterSavedEvaluations: evaluationsAfter.length, beforeAttempts: attemptsBefore.length, afterAttempts: attemptsAfter.length, beforeReferences: qualityBefore.referenceCount, afterReferences: qualityAfter.referenceCount, newModelCalls: 0, newHumanJudgmentsByRehearsal: 0, savedChecklistVersionsCreated: 0, liveStep: 'Skipped deliberately; all displayed AI results were previously saved actual API responses.' };
   writeFileSync(`${directory}/report.json`, JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
   if (report.status !== 'PASS') process.exitCode = 1;
@@ -213,4 +248,4 @@ try {
   const failure = error instanceof Error ? error.message.split('\n')[0].slice(0, 200) : 'REHEARSAL_FAILED';
   writeFileSync(`${directory}/report.json`, JSON.stringify({ status: 'BLOCKED', phase: started ? 'rehearsal' : 'preflight', failure, checkpoints, screenshots, browserErrors, blockedMutations }, null, 2));
   console.error(JSON.stringify({ status: 'BLOCKED', failure })); process.exitCode = 1;
-} finally { await browser.close(); }
+} finally { if (heartbeat) clearInterval(heartbeat); await browser.close(); }
