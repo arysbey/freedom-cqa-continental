@@ -14,7 +14,7 @@ const resultSchema = z.object({
 }).strict();
 const responseSchema = z.object({ results: z.array(resultSchema) }).strict();
 
-type EvidenceFailureReason = 'response schema does not match the contract' | 'criterion count mismatch' | 'ambiguous source message IDs' | 'unknown or duplicated criterion' | 'answer is outside the saved criterion scale' | 'N/A has no configured condition' | 'N/A requires an applicability rationale' | 'missing checked range for omission, partial answer or N/A' | 'no source evidence or checked range' | 'positive answer requires source evidence' | 'invalid checked source range' | 'quotation is not an exact source substring' | 'flag requires direct operator evidence' | 'review request must explain uncertainty';
+type EvidenceFailureReason = 'positive operator action requires operator evidence' | 'response schema does not match the contract' | 'criterion count mismatch' | 'ambiguous source message IDs' | 'unknown or duplicated criterion' | 'answer is outside the saved criterion scale' | 'N/A has no configured condition' | 'N/A requires an applicability rationale' | 'missing checked range for omission, partial answer or N/A' | 'no source evidence or checked range' | 'positive answer requires source evidence' | 'invalid checked source range' | 'quotation is not an exact source substring' | 'flag requires direct operator evidence' | 'review request must explain uncertainty';
 export class EvidenceValidationError extends Error {
   readonly code = 'INVALID_EVIDENCE';
   constructor(readonly reason: EvidenceFailureReason, readonly resultIndex: number | null = null, readonly schemaIssues: Array<{ code: string; path: Array<string | number> }> = []) { super(`Evaluation rejected: ${reason}`); }

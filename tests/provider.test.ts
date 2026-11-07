@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import type { Checklist, Conversation } from '../src/domain.js';
+import { initialChecklist } from '../src/checklist.js';
+import { validateEvidence } from '../server/evidence.js';
 import { GeminiProvider, getProviderConfigurationIdentity, getProviderTelemetry, minimizeConversation, safeProviderFailure, type ProviderConfig, type ProviderTelemetry, type ProviderTransport } from '../server/provider.js';
 
 const config: ProviderConfig = { apiKey: 'test-double-key-not-live', freeTierConfirmed: true, provider: 'gemini', model: 'gemini-3.8-flash', mode: 'free', timeoutMs: 1000, retryLimit: 0 };
@@ -11,6 +13,21 @@ function output(quote = 'Здравствуйте!') {
   return { results: [{ criterionId: 'GREETING', answer: 'YES', applicabilityRationale: 'Применимо.', explanation: 'Есть приветствие.', evidence: [{ messageId: 'v1:0', quote }], checkedRange: null, reviewRequired: false, uncertainty: '' }] };
 }
 const transport: ProviderTransport = { listModels: async () => [{ name: 'models/gemini-3.8-flash', supportedActions: ['generateContent'] }], generate: async () => ({ text: JSON.stringify(output()), usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 30, totalTokenCount: 130 } }) };
+
+test('generation rejects canonical clarification credited only to a client while legacy/history validation remains unchanged', async () => {
+  const source = { ...conversation, messages: [{ ...conversation.messages[0], speaker: 'client' as const }] };
+  const rubric = { ...initialChecklist, criteria: initialChecklist.criteria.filter(c => c.id === 'C2') };
+  const raw = { results: [{ ...output().results[0], criterionId: 'C2', checkedRange: { startMessageId: 'v1:0', endMessageId: 'v1:0' } }] };
+  assert.equal(validateEvidence(source, rubric, raw)[0].answer, 'YES');
+  let calls = 0;
+  try {
+    await new GeminiProvider(config, { ...transport, generate: async () => { calls++; return { text: JSON.stringify(raw) }; } }).evaluate(source, rubric);
+    assert.fail('Expected role evidence rejection');
+  } catch (error) {
+    assert.equal(calls, 1); assert.equal(getProviderTelemetry(error)?.terminalCode, 'INVALID_EVIDENCE');
+    assert.match((error as Error).message, /positive operator action requires operator evidence/);
+  }
+});
 
 test('absent key never invokes provider or creates fallback result', async () => {
   let calls = 0;
@@ -240,7 +257,7 @@ test('provider requests a required range object and records the exact prior conf
   const result = await new GeminiProvider(config, { ...transport, generate: async request => { systemInstruction = request.systemInstruction; schema = request.schema; return transport.generate(request); } }).evaluate(conversation, checklist);
   const rangeSchema = (schema as { properties: { results: { items: { properties: { checkedRange: { type: unknown } } } } } }).properties.results.items.properties.checkedRange;
   assert.equal(rangeSchema.type, 'object');
-  const legacySemantic = { provider: config.provider, model: config.model, mode: config.mode, api: 'generateContent', thinkingLevel: 'LOW', maxOutputTokens: 10000, promptVersion: 'evidence-first-v2', schemaVersion: 'criterion-evidence-v1', minimizationVersion: 'source-redaction-v1', systemInstruction };
+  const legacySemantic = { provider: config.provider, model: config.model, mode: config.mode, api: 'generateContent', thinkingLevel: 'LOW', maxOutputTokens: 10000, promptVersion: 'evidence-first-v2', schemaVersion: 'criterion-evidence-v1', minimizationVersion: 'source-redaction-v1', systemInstruction, operatorEvidenceVersion: 'canonical-discovery-closing-role-v1' };
   const previous = createHash('sha256').update(JSON.stringify(legacySemantic)).digest('hex');
   assert.equal(result.configuration.compatiblePreviousFingerprint, previous);
   assert.notEqual(result.configuration.configurationFingerprint, previous);

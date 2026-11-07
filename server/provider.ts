@@ -3,6 +3,7 @@ import type { Checklist, Conversation, CriterionResult } from '../src/domain.js'
 import { EvidenceValidationError, evaluationJsonSchema, validateEvidence } from './evidence.js';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
+import { operatorEvidenceVersion, validateGeneratedOperatorEvidence } from './operator-evidence.js';
 
 export interface ProviderConfig {
   apiKey: string | undefined;
@@ -119,13 +120,13 @@ First locate source evidence, then decide each answer. Give exact nonempty sourc
 
 /** Recovery settings deliberately do not change the semantic configuration identity. */
 export function getProviderConfigurationIdentity(config: ProviderConfig) {
-  const semantic = { provider: config.provider, model: config.model, mode: config.mode, api: 'generateContent', thinkingLevel: config.model.startsWith('gemini-3.') ? 'LOW' : 'provider-default', maxOutputTokens: 10000, promptVersion: 'evidence-first-v2' as const, schemaVersion: 'criterion-evidence-v1' as const, minimizationVersion: 'source-redaction-v1', systemInstruction: SYSTEM_INSTRUCTION };
+  const semantic = { provider: config.provider, model: config.model, mode: config.mode, api: 'generateContent', thinkingLevel: config.model.startsWith('gemini-3.') ? 'LOW' : 'provider-default', maxOutputTokens: 10000, promptVersion: 'evidence-first-v2' as const, schemaVersion: 'criterion-evidence-v1' as const, minimizationVersion: 'source-redaction-v1', systemInstruction: SYSTEM_INSTRUCTION, operatorEvidenceVersion };
   const compatiblePreviousFingerprint = createHash('sha256').update(JSON.stringify(semantic)).digest('hex');
   const compatibleSourceSpanFingerprint = createHash('sha256').update(JSON.stringify({ ...semantic, generationConstraintVersion: 'all-criteria-source-span-v1' })).digest('hex');
   const compatibleExactQuotesFingerprint = createHash('sha256').update(JSON.stringify({ ...semantic, generationConstraintVersion: 'all-criteria-source-span-exact-quotes-v2' })).digest('hex');
   const compatibleFlatQuotesFingerprint = createHash('sha256').update(JSON.stringify({ ...semantic, generationConstraintVersion: 'all-criteria-source-span-flat-quotes-v3' })).digest('hex');
   const generationConstraintVersion = 'all-criteria-source-span-copy-quotes-v4' as const;
-  return { configurationFingerprint: createHash('sha256').update(JSON.stringify({ ...semantic, generationConstraintVersion })).digest('hex'), compatiblePreviousFingerprint, compatibleSourceSpanFingerprint, compatibleExactQuotesFingerprint, compatibleFlatQuotesFingerprint, generationConstraintVersion, generationCompatibilityScope: 'configuration-transition-only-not-vendor-acceptance' as const, promptVersion: semantic.promptVersion, schemaVersion: semantic.schemaVersion, recoveryVersion: 'bounded-recovery-v1' as const };
+  return { configurationFingerprint: createHash('sha256').update(JSON.stringify({ ...semantic, generationConstraintVersion })).digest('hex'), compatiblePreviousFingerprint, compatibleSourceSpanFingerprint, compatibleExactQuotesFingerprint, compatibleFlatQuotesFingerprint, generationConstraintVersion, generationCompatibilityScope: 'configuration-transition-only-not-vendor-acceptance' as const, promptVersion: semantic.promptVersion, operatorEvidenceVersion, schemaVersion: semantic.schemaVersion, recoveryVersion: 'bounded-recovery-v1' as const };
 }
 const transientNetworkCodes = new Set(['ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET']);
 const RETRY_DELAY_MS = 500;
@@ -305,6 +306,8 @@ export class GeminiProvider {
         const validMinimized = validateEvidence(minimized.conversation, checklist, raw);
         validationStage = 'original-source';
         results = validateEvidence(conversation, checklist, { results: minimized.restore(validMinimized) });
+        validationStage = 'operator-role';
+        validateGeneratedOperatorEvidence(conversation, checklist, results);
       } catch (error) {
         recordDiagnostic({ status: 'validation-rejected', validationStage, validationFailure: error instanceof EvidenceValidationError ? { code: error.code, reason: error.reason, resultIndex: error.resultIndex, schemaIssues: error.schemaIssues } : { code: 'VALIDATION_FAILED', reason: 'unexpected validation failure', resultIndex: null } });
         throw error;
