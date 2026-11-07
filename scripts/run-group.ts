@@ -2,11 +2,12 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { config } from '../server/config.js';
 import { Store } from '../server/store.js';
-import { BatchStore, createGroupBatch, findValidOfficialEvaluation, runGroupBatch } from '../server/batches.js';
+import { BatchStore, createGroupBatch, findValidOfficialEvaluation, runGroupBatch, validateBatchDeadlineAt } from '../server/batches.js';
 import { publicErrorCode } from '../server/errors.js';
+import { getProviderConfigurationIdentity } from '../server/provider.js';
 
-const flags = new Set(['--execute', '--dry-run', '--resume', '--pause', '--cancel', '--recover-interrupted', '--retry-quota']);
-const values = new Set(['--group', '--batch', '--id', '--min-spacing-ms', '--budget-ms']);
+const flags = new Set(['--execute', '--dry-run', '--resume', '--pause', '--cancel', '--recover-interrupted', '--retry-quota', '--require-current-configuration']);
+const values = new Set(['--group', '--batch', '--id', '--min-spacing-ms', '--budget-ms', '--stop-at']);
 const argumentsMap = new Map<string, string>(); const selectedFlags = new Set<string>();
 for (let i = 2; i < process.argv.length; i++) {
   const arg = process.argv[i];
@@ -18,15 +19,19 @@ const dryRun = selectedFlags.has('--dry-run') || !selectedFlags.has('--execute')
 const store = new Store(config.dbPath); let batches: BatchStore | undefined;
 try {
   if (config.model !== 'gemini-3.1-flash-lite') throw new Error('MODEL_CHANGE_REQUIRES_USER_APPROVAL');
+  const deadlineAt = validateBatchDeadlineAt(argumentsMap.get('--stop-at'));
   const existingId = argumentsMap.get('--batch'); const group = argumentsMap.get('--group');
   if (dryRun && !existingId) {
     if (!group) throw new Error('GROUP_ID_REQUIRED');
     const records = store.listConversations(group); if (!records.length) throw new Error('GROUP_NOT_IMPORTED');
+    const fingerprint = selectedFlags.has('--require-current-configuration') ? getProviderConfigurationIdentity(config).configurationFingerprint : undefined;
     console.log(JSON.stringify({ status: 'DRY_RUN', groupId: group, model: config.model, checklistVersion: 'official-v1', noCallsMade: true, noBatchWritten: true,
-      records: records.map(c => ({ conversationId: c.conversationId, conversationVersion: c.version, validOfficialResult: Boolean(findValidOfficialEvaluation(store, c)), localHumanOnly: c.classification === 'real_restricted' || c.audioAvailable || c.channel !== 'agent chat', explicitPermissionCheckRequired: c.classification === 'unknown' })) }, null, 2));
+      requireCurrentConfiguration: Boolean(fingerprint), ...(fingerprint ? { configurationFingerprint: fingerprint } : {}), ...(deadlineAt !== undefined ? { deadlineAt } : {}), records: records.map(c => ({ conversationId: c.conversationId, conversationVersion: c.version, validOfficialResult: Boolean(findValidOfficialEvaluation(store, c, config.model, fingerprint)), localHumanOnly: c.classification === 'real_restricted' || c.audioAvailable || c.channel !== 'agent chat', explicitPermissionCheckRequired: c.classification === 'unknown' })) }, null, 2));
   } else {
     batches = new BatchStore(config.dbPath, { readOnly: dryRun });
-    let batch = existingId ? batches.required(existingId) : createGroupBatch(store, batches, { groupId: group || '', id: argumentsMap.get('--id'), minSpacingMs: argumentsMap.has('--min-spacing-ms') ? Number(argumentsMap.get('--min-spacing-ms')) : undefined, runBudgetMs: argumentsMap.has('--budget-ms') ? Number(argumentsMap.get('--budget-ms')) : undefined });
+    let batch = existingId ? batches.required(existingId) : createGroupBatch(store, batches, { groupId: group || '', id: argumentsMap.get('--id'), minSpacingMs: argumentsMap.has('--min-spacing-ms') ? Number(argumentsMap.get('--min-spacing-ms')) : undefined, runBudgetMs: argumentsMap.has('--budget-ms') ? Number(argumentsMap.get('--budget-ms')) : undefined, requireCurrentConfiguration: selectedFlags.has('--require-current-configuration'), ...(deadlineAt !== undefined ? { deadlineAt } : {}) });
+    if (selectedFlags.has('--require-current-configuration') && !batch.requireCurrentConfiguration) throw new Error('BATCH_CONFIGURATION_REQUIREMENT_IS_IMMUTABLE');
+    if (deadlineAt !== undefined && batch.deadlineAt !== deadlineAt) throw new Error('BATCH_DEADLINE_IS_IMMUTABLE');
     if (dryRun) console.log(JSON.stringify({ status: 'DRY_RUN', noCallsMade: true, batch }, null, 2));
     else {
       if (selectedFlags.has('--cancel')) batch = batches.cancel(batch.id);

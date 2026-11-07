@@ -2,8 +2,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mkdirSync, mkdtempSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import { BatchStore, batchExecutorState, batchRequestId, createGroupBatch, findValidOfficialEvaluation, isValidOfficialEvaluation, runGroupBatch, type GroupBatch } from '../server/batches.js';
+import { BatchStore, batchExecutorState, batchRequestId, createGroupBatch, findValidOfficialEvaluation, isValidOfficialEvaluation, runGroupBatch, validateBatchDeadlineAt, type GroupBatch } from '../server/batches.js';
 import { Store } from '../server/store.js';
 import { PermissionStore } from '../server/data-permissions.js';
 import { parseOrganizerResponse } from '../server/importer.js';
@@ -42,7 +43,7 @@ function telemetry(failed: boolean): ProviderTelemetry {
     reportedUsage: { inputTokens: null, outputTokens: null, thoughtTokens: null, cachedTokens: null, totalTokens: failed ? null : 130 }, unknownUsageCalls: failed ? 2 : 1, diagnosticId: 'software-fixture', outcome: failed ? 'failed' : 'succeeded' };
 }
 function attempt(conversation: Conversation, id: string): EvaluationAttempt { return { id, requestId: id, conversationVersion: conversation.version, checklistVersion: initialChecklist.version, model: config.model, startedAt: '2026-11-07T10:00:00.000Z', finishedAt: null, status: 'running', errorCode: null, evaluationId: null, usage: null, latencyMs: null, recoveryDepth: 0 }; }
-function executor(context: ReturnType<typeof setup>, failures: Array<string | null> = []) {
+function executor(context: ReturnType<typeof setup>, failures: Array<string | null> = [], configurationFingerprint?: string) {
   const calls: Array<{ id: string; retryOf?: string; cv: string; kv: string }> = [];
   const execute: typeof evaluateAndSave = async (store, cv, kv, options = {}) => {
     const id = options.attemptId!; const conversation = store.getConversation(cv)!;
@@ -51,13 +52,14 @@ function executor(context: ReturnType<typeof setup>, failures: Array<string | nu
     const errorCode = failures.shift();
     if (errorCode) { store.finishEvaluationAttempt({ ...pending, status: 'failed', finishedAt: '2026-11-07T10:00:01.000Z', errorCode, telemetry: telemetry(true), latencyMs: 1000 }); throw new ProviderError(errorCode, 'Software fixture failure.'); }
     const saved = evaluation(conversation, `eval_${calls.length}_${id}`, id);
+    if (configurationFingerprint) saved.configuration.configurationFingerprint = configurationFingerprint;
     store.saveEvaluationWithAttempt(saved, { ...pending, status: 'succeeded', finishedAt: saved.createdAt, evaluationId: saved.id, telemetry: telemetry(false), latencyMs: 1000, usage: saved.usage }); return saved;
   };
   void context;
   return { execute, calls };
 }
 function clock() { let value = 1794050000000; const sleeps: number[] = []; return { now: () => value, sleep: async (ms: number) => { sleeps.push(ms); value += ms; }, random: () => 0.5, advance: (ms: number) => { value += ms; }, sleeps }; }
-function create(context: ReturnType<typeof setup>, options: Partial<Pick<GroupBatch, 'groupId' | 'minSpacingMs' | 'runBudgetMs'>> = {}) { return createGroupBatch(context.store, context.batches, { groupId: 'DEV', minSpacingMs: 0, ...options }); }
+function create(context: ReturnType<typeof setup>, options: Partial<Pick<GroupBatch, 'groupId' | 'minSpacingMs' | 'runBudgetMs' | 'deadlineAt'>> = {}) { return createGroupBatch(context.store, context.batches, { groupId: 'DEV', minSpacingMs: 0, ...options }); }
 
 test('arbitrary ten-record groups preserve original IDs, block unknown data, then use only explicit version-bound permissions', async () => {
   const c = setup(10, 'CONTROL_SOFTWARE_FIXTURE'); const fake = executor(c); const time = clock();
@@ -254,5 +256,119 @@ test('each batch run records its current process/session without changing frozen
     assert.equal(completed.executorPid, process.pid); assert.match(completed.executorSessionId!, /^[0-9a-f-]{36}$/);
     assert.equal(completed.configurationFingerprint, batch.configurationFingerprint); assert.equal(completed.checklistFingerprint, batch.checklistFingerprint);
     assert.equal(completed.id, batch.id); assert.equal(fake.calls.length, 1);
+  } finally { c.close(); }
+});
+
+test('explicit configuration-bound rescoring replaces reuse of old prompts without deleting results or repeating new successes', async () => {
+  const c = setup();
+  try {
+    const source = c.conversations[0]; const old = evaluation(source, 'prior-semantic-profile'); old.configuration.configurationFingerprint = 'prior-profile'; c.store.saveEvaluation(old);
+    const fingerprint = getProviderConfigurationIdentity(config).configurationFingerprint;
+    assert.equal(findValidOfficialEvaluation(c.store, source)?.id, old.id);
+    assert.equal(findValidOfficialEvaluation(c.store, source, config.model, fingerprint), undefined);
+    const ordinary = create(c); const unused = executor(c);
+    assert.equal((await runGroupBatch(c.store, c.batches, ordinary.id, { ...unused, ...clock() })).records[0].status, 'reused'); assert.equal(unused.calls.length, 0);
+    const strict = createGroupBatch(c.store, c.batches, { groupId: 'DEV', minSpacingMs: 0, requireCurrentConfiguration: true }); const fresh = executor(c, [], fingerprint);
+    const completed = await runGroupBatch(c.store, c.batches, strict.id, { ...fresh, ...clock() });
+    assert.equal(completed.records[0].status, 'succeeded'); assert.equal(fresh.calls.length, 1); assert.equal(c.store.getEvaluation(old.id)?.id, old.id);
+    c.batches.resume(strict.id); await runGroupBatch(c.store, c.batches, strict.id, { ...fresh, ...clock() }); assert.equal(fresh.calls.length, 1);
+    const repeat = createGroupBatch(c.store, c.batches, { groupId: 'DEV', minSpacingMs: 0, requireCurrentConfiguration: true });
+    assert.equal((await runGroupBatch(c.store, c.batches, repeat.id, { ...fresh, ...clock() })).records[0].status, 'reused'); assert.equal(fresh.calls.length, 1);
+    assert.throws(() => c.batches.save({ ...c.batches.required(strict.id), requireCurrentConfiguration: false }), /IMMUTABLE_BATCH_SOURCE/);
+    assert.throws(() => createGroupBatch(c.store, c.batches, { id: strict.id, groupId: 'DEV', minSpacingMs: 0 }), /BATCH_IDEMPOTENCY_CONFLICT/);
+  } finally { c.close(); }
+});
+
+test('configuration-bound reruns preserve authentic local human reuse without an AI prompt fingerprint', async () => {
+  const c = setup();
+  try {
+    const source = c.conversations[0]; const human = { ...evaluation(source, 'authentic-local-fixture'), provider: 'local', model: 'none', mode: 'local' as const, status: 'human_entered' as const, origin: 'human' as const, reviewer: 'SOFTWARE_ONLY_HUMAN_FIXTURE', configuration: { humanAttestation: true, softwareFixtureNotGold: true } };
+    c.store.saveEvaluation(human); const fake = executor(c);
+    const batch = createGroupBatch(c.store, c.batches, { groupId: 'DEV', minSpacingMs: 0, requireCurrentConfiguration: true });
+    const result = await runGroupBatch(c.store, c.batches, batch.id, { ...fake, ...clock() });
+    assert.equal(result.records[0].status, 'reused'); assert.equal(result.records[0].evaluationId, human.id); assert.equal(fake.calls.length, 0);
+  } finally { c.close(); }
+});
+
+test('absolute deadlines require canonical UTC and form immutable idempotent batch input', () => {
+  const c = setup(); const time = clock(); const deadlineAt = new Date(time.now() + 600000).toISOString();
+  try {
+    assert.equal(validateBatchDeadlineAt(undefined), undefined);
+    for (const invalid of ['not-a-date', '2026-11-07', '2026-11-07T12:00:00', '2026-11-07T12:00:00Z', '2026-11-07T12:00:00.000+00:00', '2026-02-30T12:00:00.000Z']) assert.throws(() => create(c, { deadlineAt: invalid }), /INVALID_BATCH_DEADLINE/);
+    const batch = create(c, { deadlineAt });
+    assert.equal(batch.deadlineAt, deadlineAt);
+    assert.deepEqual(createGroupBatch(c.store, c.batches, { groupId: 'DEV', id: batch.id, minSpacingMs: 0, deadlineAt }), batch);
+    assert.throws(() => c.batches.save({ ...batch, deadlineAt: new Date(time.now() + 1200000).toISOString() }), /IMMUTABLE_BATCH_SOURCE/);
+    assert.throws(() => c.batches.save({ ...batch, deadlineAt: undefined }), /IMMUTABLE_BATCH_SOURCE/);
+    assert.throws(() => createGroupBatch(c.store, c.batches, { groupId: 'DEV', id: batch.id, minSpacingMs: 0 }), /BATCH_IDEMPOTENCY_CONFLICT/);
+    const legacy = create(c); assert.equal(Object.hasOwn(legacy, 'deadlineAt'), false);
+  } finally { c.close(); }
+});
+
+test('an absolute deadline that cannot fit the full provider budget dispatches no request', async () => {
+  const c = setup(); const time = clock(); const fake = executor(c);
+  try {
+    const deadlineAt = new Date(time.now() + config.timeoutMs + 999).toISOString(); const batch = create(c, { deadlineAt });
+    const paused = await runGroupBatch(c.store, c.batches, batch.id, { ...fake, ...time });
+    assert.equal(paused.reason, 'ABSOLUTE_DEADLINE_EXHAUSTED'); assert.equal(fake.calls.length, 0); assert.equal(c.store.listEvaluationAttempts().length, 0);
+    assert.equal(paused.deadlineAt, deadlineAt); assert.equal(paused.records[0].runs.length, 0);
+  } finally { c.close(); }
+});
+
+test('pause and resume cannot extend the absolute cutoff, while saved results remain reusable', async () => {
+  const c = setup(2, 'DEADLINE_RESUME_FIXTURE'); const time = clock(); const fake = executor(c); c.conversations.forEach(item => approve(c, item));
+  try {
+    const deadlineAt = new Date(time.now() + config.timeoutMs + 6000).toISOString(); const batch = create(c, { groupId: 'DEADLINE_RESUME_FIXTURE', deadlineAt });
+    const execute: typeof evaluateAndSave = async (...args) => { const saved = await fake.execute(...args); time.advance(6000); return saved; };
+    let paused = await runGroupBatch(c.store, c.batches, batch.id, { ...time, execute, permissions: c.permissions });
+    assert.equal(fake.calls.length, 1); assert.equal(paused.reason, 'ABSOLUTE_DEADLINE_EXHAUSTED'); assert.equal(paused.records[0].status, 'succeeded');
+    c.batches.close(); c.batches = new BatchStore(c.path); c.batches.resume(batch.id); time.advance(config.timeoutMs + 10000);
+    paused = await runGroupBatch(c.store, c.batches, batch.id, { ...fake, ...time, permissions: c.permissions });
+    assert.equal(paused.deadlineAt, deadlineAt); assert.equal(paused.reason, 'ABSOLUTE_DEADLINE_EXHAUSTED'); assert.equal(fake.calls.length, 1); assert.equal(paused.records[1].runs.length, 0);
+    assert(['succeeded', 'reused'].includes(paused.records[0].status)); assert.equal(c.store.listEvaluations().length, 1);
+  } finally { c.close(); }
+});
+
+test('an overlong sleep is rechecked against the absolute deadline before creating the next request', async () => {
+  const c = setup(2, 'DEADLINE_SLEEP_FIXTURE'); const time = clock(); const fake = executor(c); c.conversations.forEach(item => approve(c, item));
+  try {
+    const batch = create(c, { groupId: 'DEADLINE_SLEEP_FIXTURE', minSpacingMs: 1000, deadlineAt: new Date(time.now() + config.timeoutMs + 2000).toISOString() });
+    const result = await runGroupBatch(c.store, c.batches, batch.id, { ...fake, ...time, sleep: async ms => { await time.sleep(ms); time.advance(2); }, permissions: c.permissions });
+    assert.equal(time.sleeps[0], 1000); assert.equal(result.reason, 'ABSOLUTE_DEADLINE_EXHAUSTED'); assert.equal(fake.calls.length, 1); assert.equal(result.records[1].runs.length, 0);
+    assert.equal(c.store.listEvaluationAttempts().length, 1);
+  } finally { c.close(); }
+});
+
+test('retry backoff must fit the immutable absolute deadline and cannot start a late linked child', async () => {
+  const c = setup(); const time = clock(); const fake = executor(c, ['PROVIDER_FAILED', null]);
+  try {
+    const batch = create(c, { deadlineAt: new Date(time.now() + config.timeoutMs + 1500).toISOString() });
+    const paused = await runGroupBatch(c.store, c.batches, batch.id, { ...fake, ...time });
+    assert.equal(paused.reason, 'ABSOLUTE_DEADLINE_EXHAUSTED'); assert.equal(fake.calls.length, 1); assert.equal(paused.records[0].runs.length, 1);
+    assert.equal(paused.records[0].errorCode, 'PROVIDER_FAILED'); assert.equal(c.store.listEvaluations().length, 0);
+  } finally { c.close(); }
+});
+
+test('an expired deadline does not prevent zero-call reuse of already valid results', async () => {
+  const c = setup(); const time = clock(); const saved = evaluation(c.conversations[0], 'saved-before-deadline'); c.store.saveEvaluation(saved); const fake = executor(c);
+  try {
+    const batch = create(c, { deadlineAt: new Date(time.now() - 1000).toISOString() });
+    const completed = await runGroupBatch(c.store, c.batches, batch.id, { ...fake, ...time });
+    assert.equal(completed.status, 'completed'); assert.equal(completed.records[0].status, 'reused'); assert.equal(completed.records[0].evaluationId, saved.id); assert.equal(fake.calls.length, 0);
+  } finally { c.close(); }
+});
+
+test('actual CLI accepts stop-at with the current-configuration flag and an expired cutoff makes no attempt', () => {
+  const c = setup(); const deadlineAt = '2020-01-01T00:00:00.000Z';
+  const env = { ...process.env, CQA_DB_PATH: c.path, CQA_MODEL: config.model, GEMINI_API_KEY: '', GEMINI_FREE_TIER_CONFIRMED: 'true' };
+  const cli = ['--import', 'tsx', resolve('scripts/run-group.ts')];
+  try {
+    const preview = spawnSync(process.execPath, [...cli, '--group', 'DEV', '--dry-run', '--require-current-configuration', '--stop-at', deadlineAt], { env, encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    assert.equal(preview.status, 0, preview.stderr); const plan = JSON.parse(preview.stdout); assert.equal(plan.deadlineAt, deadlineAt); assert.equal(plan.requireCurrentConfiguration, true); assert.equal(plan.noCallsMade, true); assert.equal(c.batches.list().length, 0);
+    const run = spawnSync(process.execPath, [...cli, '--group', 'DEV', '--id', 'CLI_ABSOLUTE_DEADLINE_FIXTURE', '--execute', '--require-current-configuration', '--stop-at', deadlineAt], { env, encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    assert.equal(run.status, 2, run.stderr); assert(run.stdout.includes('ABSOLUTE_DEADLINE_EXHAUSTED'));
+    const batch = c.batches.required('CLI_ABSOLUTE_DEADLINE_FIXTURE'); assert.equal(batch.deadlineAt, deadlineAt); assert.equal(batch.requireCurrentConfiguration, true); assert.equal(c.store.listEvaluationAttempts().length, 0);
+    const changed = spawnSync(process.execPath, [...cli, '--batch', batch.id, '--resume', '--execute', '--stop-at', '2020-01-02T00:00:00.000Z'], { env, encoding: 'utf8', windowsHide: true, timeout: 20000 });
+    assert.equal(changed.status, 1); assert(changed.stderr.includes('BATCH_DEADLINE_IS_IMMUTABLE')); assert.equal(c.batches.required(batch.id).deadlineAt, deadlineAt);
   } finally { c.close(); }
 });

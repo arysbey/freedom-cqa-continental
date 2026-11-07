@@ -27,9 +27,17 @@ export interface GroupBatch {
   status: 'ready' | 'running' | 'paused' | 'completed' | 'cancelled'; control: 'run' | 'pause' | 'cancel'; reason: string | null;
   allowInterruptedRecovery: boolean; retryQuota: boolean; records: BatchRecord[];
   executorPid?: number; executorSessionId?: string;
+  requireCurrentConfiguration?: boolean;
+  deadlineAt?: string;
 }
 const sha = (value: unknown) => createHash('sha256').update(canonicalJson(value)).digest('hex');
-const identity = (batch: GroupBatch) => ({ id: batch.id, groupId: batch.groupId, model: batch.model, configurationFingerprint: batch.configurationFingerprint, checklistVersion: batch.checklistVersion, checklistFingerprint: batch.checklistFingerprint, createdAt: batch.createdAt, minSpacingMs: batch.minSpacingMs, runBudgetMs: batch.runBudgetMs, sources: batch.records.map(r => [r.conversationId, r.conversationVersion]) });
+const identity = (batch: GroupBatch) => ({ id: batch.id, groupId: batch.groupId, model: batch.model, configurationFingerprint: batch.configurationFingerprint, ...(batch.requireCurrentConfiguration ? { requireCurrentConfiguration: true } : {}), ...(batch.deadlineAt !== undefined ? { deadlineAt: batch.deadlineAt } : {}), checklistVersion: batch.checklistVersion, checklistFingerprint: batch.checklistFingerprint, createdAt: batch.createdAt, minSpacingMs: batch.minSpacingMs, runBudgetMs: batch.runBudgetMs, sources: batch.records.map(r => [r.conversationId, r.conversationVersion]) });
+/** Explicit UTC only; date-only/local-time inputs must never decide the final-hour cutoff. */
+export function validateBatchDeadlineAt(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) || !Number.isFinite(Date.parse(value)) || new Date(value).toISOString() !== value) throw new Error('INVALID_BATCH_DEADLINE');
+  return value;
+}
 export const officialChecklistFingerprint = sha(initialChecklist);
 export function batchRequestId(batch: Pick<GroupBatch, 'id' | 'checklistVersion'>, conversationVersion: string, generation: number) { return 'batch_' + sha([batch.id, conversationVersion, batch.checklistVersion, generation]).slice(0, 56); }
 
@@ -78,25 +86,27 @@ export class BatchStore {
   close() { this.db.close(); }
 }
 
-export function isValidOfficialEvaluation(store: Store, conversation: Conversation, evaluation: Evaluation, model = config.model): boolean {
+export function isValidOfficialEvaluation(store: Store, conversation: Conversation, evaluation: Evaluation, model = config.model, configurationFingerprint?: string): boolean {
   const checklist = store.getChecklist(evaluation.checklistVersion);
   if (!checklist || evaluation.conversationVersion !== conversation.version || evaluation.checklistVersion !== initialChecklist.version || canonicalJson(checklist) !== canonicalJson(initialChecklist)) return false;
   const ai = conversation.classification !== 'real_restricted' && conversation.channel === 'agent chat' && !conversation.audioAvailable && evaluation.status === 'live_validated' && evaluation.origin === 'ai' && evaluation.provider === 'gemini' && evaluation.mode === 'free' && evaluation.model === model;
   const human = evaluation.status === 'human_entered' && evaluation.origin === 'human' && evaluation.provider === 'local' && evaluation.mode === 'local' && evaluation.model === 'none' && !!evaluation.reviewer?.trim() && evaluation.configuration.humanAttestation === true;
   if (!ai && !human) return false;
+  if (ai && configurationFingerprint !== undefined && evaluation.configuration.configurationFingerprint !== configurationFingerprint) return false;
   try { validateEvidence(conversation, initialChecklist, { results: evaluation.results }); return canonicalJson(calculateScore(initialChecklist, evaluation.results)) === canonicalJson(evaluation.score); } catch { return false; }
 }
-export function findValidOfficialEvaluation(store: Store, conversation: Conversation, model = config.model) { return store.listEvaluations().toReversed().find(e => isValidOfficialEvaluation(store, conversation, e, model)); }
-export function createGroupBatch(store: Store, batches: BatchStore, options: { groupId: string; id?: string; minSpacingMs?: number; runBudgetMs?: number }): GroupBatch {
+export function findValidOfficialEvaluation(store: Store, conversation: Conversation, model = config.model, configurationFingerprint?: string) { return store.listEvaluations().toReversed().find(e => isValidOfficialEvaluation(store, conversation, e, model, configurationFingerprint)); }
+export function createGroupBatch(store: Store, batches: BatchStore, options: { groupId: string; id?: string; minSpacingMs?: number; runBudgetMs?: number; requireCurrentConfiguration?: boolean; deadlineAt?: string }): GroupBatch {
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(options.groupId)) throw new Error('INVALID_GROUP_ID');
+  const deadlineAt = validateBatchDeadlineAt(options.deadlineAt);
   const minSpacingMs = options.minSpacingMs ?? 12000; const runBudgetMs = options.runBudgetMs ?? 45 * 60000;
   if (!Number.isInteger(minSpacingMs) || minSpacingMs < 0 || minSpacingMs > 600000 || !Number.isInteger(runBudgetMs) || runBudgetMs < 1000 || runBudgetMs > 7200000) throw new Error('INVALID_BATCH_BUDGET');
   const id = options.id || randomUUID(); if (!/^[A-Za-z0-9_-]{8,128}$/.test(id)) throw new Error('INVALID_BATCH_ID');
-  const existing = batches.get(id); if (existing) { if (existing.groupId !== options.groupId || existing.minSpacingMs !== minSpacingMs || existing.runBudgetMs !== runBudgetMs) throw new Error('BATCH_IDEMPOTENCY_CONFLICT'); return existing; }
+  const existing = batches.get(id); if (existing) { if (existing.groupId !== options.groupId || existing.minSpacingMs !== minSpacingMs || existing.runBudgetMs !== runBudgetMs || (existing.requireCurrentConfiguration ?? false) !== (options.requireCurrentConfiguration ?? false) || existing.deadlineAt !== deadlineAt) throw new Error('BATCH_IDEMPOTENCY_CONFLICT'); return existing; }
   if (canonicalJson(store.getChecklist(initialChecklist.version)) !== canonicalJson(initialChecklist)) throw new Error('OFFICIAL_CHECKLIST_SNAPSHOT_REQUIRED');
   const conversations = store.listConversations(options.groupId); if (!conversations.length) throw new Error('GROUP_NOT_IMPORTED');
   const timestamp = new Date().toISOString();
-  return batches.create({ id, groupId: options.groupId, model: config.model, configurationFingerprint: getProviderConfigurationIdentity(config).configurationFingerprint, checklistVersion: initialChecklist.version, checklistFingerprint: officialChecklistFingerprint, createdAt: timestamp, minSpacingMs, runBudgetMs, revision: 0, updatedAt: timestamp, status: 'ready', control: 'run', reason: null, allowInterruptedRecovery: false, retryQuota: false,
+  return batches.create({ id, groupId: options.groupId, model: config.model, configurationFingerprint: getProviderConfigurationIdentity(config).configurationFingerprint, ...(options.requireCurrentConfiguration ? { requireCurrentConfiguration: true } : {}), ...(deadlineAt !== undefined ? { deadlineAt } : {}), checklistVersion: initialChecklist.version, checklistFingerprint: officialChecklistFingerprint, createdAt: timestamp, minSpacingMs, runBudgetMs, revision: 0, updatedAt: timestamp, status: 'ready', control: 'run', reason: null, allowInterruptedRecovery: false, retryQuota: false,
     records: conversations.map(c => ({ conversationId: c.conversationId, conversationVersion: c.version, status: 'pending', evaluationId: null, errorCode: null, runs: [], retryAt: null })) });
 }
 const transientCodes = new Set(['ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET']);
@@ -117,7 +127,10 @@ export async function runGroupBatch(store: Store, batches: BatchStore, id: strin
   if (batch.control !== 'run' || batch.status === 'cancelled') return batch;
   if (batch.model !== config.model || batch.configurationFingerprint !== getProviderConfigurationIdentity(config).configurationFingerprint || batch.checklistFingerprint !== officialChecklistFingerprint || canonicalJson(store.getChecklist(batch.checklistVersion)) !== canonicalJson(initialChecklist)) throw new Error('BATCH_CONFIGURATION_CHANGED');
   const now = options.now || Date.now; const sleep = options.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms))); const random = options.random || Math.random;
-  const started = now(); const deadline = started + batch.runBudgetMs; const execute = options.execute || evaluateAndSave;
+  const started = now(); const runDeadline = started + batch.runBudgetMs;
+  const absoluteDeadline = batch.deadlineAt !== undefined ? Date.parse(validateBatchDeadlineAt(batch.deadlineAt)!) : Infinity;
+  const deadline = Math.min(runDeadline, absoluteDeadline); const execute = options.execute || evaluateAndSave;
+  const budgetExhaustedReason = absoluteDeadline <= runDeadline ? 'ABSOLUTE_DEADLINE_EXHAUSTED' : 'RUN_TIME_BUDGET_EXHAUSTED';
   let permissionStore = options.permissions; let ownPermissions = false;
   const current = () => batches.required(id);
   const observe = (snapshot: GroupBatch) => { try { options.onProgress?.(structuredClone(snapshot)); } catch { /* Progress observers cannot invalidate saved scores. */ } };
@@ -130,7 +143,7 @@ export async function runGroupBatch(store: Store, batches: BatchStore, id: strin
       if (controlled()) { pause(options.signal?.aborted ? 'RUN_ABORTED_AFTER_CURRENT_REQUEST' : current().reason || 'USER_PAUSED'); return current(); }
       let record = current().records[index]; const conversation = store.getConversation(record.conversationVersion);
       if (!conversation) { checkpoint(index, { ...record, status: 'error', errorCode: 'SOURCE_NOT_FOUND' }); continue; }
-      const saved = findValidOfficialEvaluation(store, conversation, batch.model);
+      const saved = findValidOfficialEvaluation(store, conversation, batch.model, batch.requireCurrentConfiguration ? batch.configurationFingerprint : undefined);
       if (saved) {
         const owned = record.runs.some(run => run.requestId === saved.attemptId);
         const runs = record.runs.map(run => {
@@ -149,7 +162,7 @@ export async function runGroupBatch(store: Store, batches: BatchStore, id: strin
         record = current().records[index];
         const last = record.runs.at(-1); const ledger = last && store.getEvaluationAttempt(last.requestId);
         if (last && ledger?.status === 'running') { pause('REQUEST_OUTCOME_UNKNOWN_RESTART_OR_REVIEW_REQUIRED'); return current(); }
-        if (last && ledger?.status === 'succeeded') { const completed = ledger.evaluationId && store.getEvaluation(ledger.evaluationId); if (completed && isValidOfficialEvaluation(store, conversation, completed, batch.model)) { checkpoint(index, { ...record, status: 'succeeded', evaluationId: completed.id, errorCode: null }); break; } }
+        if (last && ledger?.status === 'succeeded') { const completed = ledger.evaluationId && store.getEvaluation(ledger.evaluationId); if (completed && isValidOfficialEvaluation(store, conversation, completed, batch.model, batch.requireCurrentConfiguration ? batch.configurationFingerprint : undefined)) { checkpoint(index, { ...record, status: 'succeeded', evaluationId: completed.id, errorCode: null }); break; } }
         if (last?.status === 'running' && !ledger) { pause('REQUEST_NOT_RECORDED_EXPLICIT_REVIEW_REQUIRED'); return current(); }
         if (last?.status === 'running' && ledger?.status === 'failed') {
           record = { ...record, status: 'error', errorCode: ledger.errorCode, runs: [...record.runs.slice(0, -1), { ...last, status: 'failed', finishedAt: ledger.finishedAt, errorCode: ledger.errorCode, providerCallCount: ledger.telemetry?.providerCallCount ?? null, usage: ledger.usage, latencyMs: ledger.latencyMs }] }; checkpoint(index, record);
@@ -163,15 +176,17 @@ export async function runGroupBatch(store: Store, batches: BatchStore, id: strin
         const previousStart = current().records.flatMap(r => r.runs).map(r => Date.parse(r.startedAt)).filter(Number.isFinite).sort((a, b) => b - a)[0];
         const backoffMs = canRetry ? Math.min(10000, 2000 * 2 ** (record.runs.length - 1)) + Math.floor(Math.max(0, Math.min(1, random())) * 500) : 0;
         const waitMs = Math.max(backoffMs, previousStart ? batch.minSpacingMs - (now() - previousStart) : 0, 0);
-        if (now() + waitMs + config.timeoutMs + 1000 > deadline) { pause('RUN_TIME_BUDGET_EXHAUSTED'); return current(); }
+        if (now() + waitMs + config.timeoutMs + 1000 > deadline) { pause(budgetExhaustedReason); return current(); }
         if (waitMs) { checkpoint(index, { ...record, status: 'retry_wait', retryAt: new Date(now() + waitMs).toISOString() }); await sleep(waitMs); }
         if (controlled()) { pause('USER_PAUSED_AFTER_CURRENT_REQUEST'); return current(); }
+        // Sleep/observer/local IO may take longer than planned. Recheck immediately before dispatch.
+        if (now() + config.timeoutMs + 1000 > deadline) { pause(budgetExhaustedReason); return current(); }
         const requestId = batchRequestId(batch, record.conversationVersion, record.runs.length);
         const retryOf = canRetry && !quotaResume ? last?.requestId : undefined;
         const run: BatchRun = { requestId, ...(retryOf ? { retryOf } : {}), status: 'running', startedAt: new Date(now()).toISOString(), finishedAt: null, errorCode: null, providerCallCount: null, usage: null, latencyMs: null };
         record = { ...record, status: 'running', runs: [...record.runs, run], errorCode: null, retryAt: null }; checkpoint(index, record);
         let errorCode: string | null = null; let evaluation: Evaluation | undefined;
-        try { evaluation = await execute(store, record.conversationVersion, batch.checklistVersion, { attemptId: requestId, ...(retryOf ? { retryOf } : {}), permissions: permissionStore }); if (!store.getEvaluation(evaluation.id) || !isValidOfficialEvaluation(store, conversation, evaluation, batch.model)) throw new Error('INVALID_OFFICIAL_RESULT'); }
+        try { evaluation = await execute(store, record.conversationVersion, batch.checklistVersion, { attemptId: requestId, ...(retryOf ? { retryOf } : {}), permissions: permissionStore }); if (!store.getEvaluation(evaluation.id) || !isValidOfficialEvaluation(store, conversation, evaluation, batch.model, batch.requireCurrentConfiguration ? batch.configurationFingerprint : undefined)) throw new Error('INVALID_OFFICIAL_RESULT'); }
         catch (error) { errorCode = publicErrorCode(error); }
         const finished = store.getEvaluationAttempt(requestId);
         const completedRun: BatchRun = { ...run, status: errorCode ? 'failed' : 'succeeded', finishedAt: new Date(now()).toISOString(), errorCode,
